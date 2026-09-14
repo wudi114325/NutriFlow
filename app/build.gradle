@@ -1,0 +1,11 @@
+plugins { id 'com.android.application' }
+
+android { namespace 'com.nutriflow.app'; compileSdk 36
+    defaultConfig { applicationId 'com.nutriflow.app'; minSdk 21; targetSdk 35; versionCode 9; versionName '0.9' }
+}
+
+dependencies {
+    implementation 'com.google.mlkit:text-recognition-chinese:16.0.1'
+}
+
+

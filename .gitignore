@@ -1,0 +1,48 @@
+# Android / Gradle build outputs
+.gradle/
+build/
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Local Android SDK and signing configuration
+local.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+keystore.properties
+
+# IDE and operating-system files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+*.secrets
+secrets.*
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Temporary files and logs
+*.log
+*.tmp
+*.temp
+*.swp
+*~
