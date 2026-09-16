@@ -20,6 +20,9 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import com.nutriflow.app.analysis.MealNutrition;
+import com.nutriflow.app.analysis.MealNutritionAnalyzer;
+
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
@@ -170,7 +173,7 @@ public class MealAccessibilityService extends AccessibilityService {
         if (detailOnly && !detail) return false;
 
         lastShownAt = now;
-        showOverlay(foodName, parsePrice(clicked, pageText), pkg);
+        showOverlay(foodName, pageText, parsePrice(clicked, pageText), pkg);
         return true;
     }
 
@@ -293,15 +296,6 @@ public class MealAccessibilityService extends AccessibilityService {
         return 25.0;
     }
 
-    private double readBudget() {
-        try {
-            return Double.parseDouble(getSharedPreferences("nutriflow", MODE_PRIVATE)
-                    .getString("budget", "25").replace("元", "").replace("¥", "").trim());
-        } catch (Exception ignored) {
-            return 25.0;
-        }
-    }
-
     private int dp(float value) {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
@@ -334,8 +328,21 @@ public class MealAccessibilityService extends AccessibilityService {
         return b;
     }
 
-    private void showOverlay(final String rawText, final double price, final String packageName) {
+    private void showOverlay(final String rawText, final String pageText,
+                             final double price, final String packageName) {
         removeOverlay();
+
+        android.content.SharedPreferences preferences =
+                getSharedPreferences("nutriflow", MODE_PRIVATE);
+        String allergy = preferences.getString("allergy", "无");
+        String taste = preferences.getString("taste", "未填写");
+        String budgetText = preferences.getString("budget", "25");
+        int portionGrams = readPortionGrams(preferences);
+        MealNutritionAnalyzer.Result analysis = MealNutritionAnalyzer.analyze(
+                rawText, pageText, price, portionGrams,
+                allergy, taste, budgetText);
+        MealNutrition nutrition = analysis.getNutrition();
+        double budget = analysis.getBudgetLimit();
 
         LinearLayout sheet = new LinearLayout(this);
         sheet.setOrientation(LinearLayout.VERTICAL);
@@ -356,7 +363,7 @@ public class MealAccessibilityService extends AccessibilityService {
 
         TextView item = txt("已捕获餐品点击：" + shorten(rawText)
                 + "\n来源：" + packageLabel(packageName)
-                + " · 默认按 500 克估算", 13, MUTED);
+                + " · " + nutrition.servingSummary(), 13, MUTED);
         item.setLineSpacing(0, 1.2f);
         sheet.addView(item, new LinearLayout.LayoutParams(-1, dp(62)));
 
@@ -364,30 +371,41 @@ public class MealAccessibilityService extends AccessibilityService {
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
         body.setPadding(0, 0, 0, dp(8));
-        body.addView(txt("本餐每 500 克营养估算", 15, DARK));
-        body.addView(txt("一餐参考值按常用每日参考量约三分之一计算，仅用于点餐比较。", 11, MUTED));
-        metric(body, "能量", "468 kcal", "一餐参考约 600 kcal · 还差 132 kcal", true);
-        metric(body, "油脂", "8.0 g", "一餐参考 ≤ 8.3 g · 未超过", false);
-        metric(body, "食盐", "1.8 g", "一餐参考 ≤ 1.7 g · 超出 0.1 g", true);
-        metric(body, "添加糖", "6.0 g", "一餐参考 ≤ 8.3 g · 未超过", false);
-        metric(body, "蛋白质", "18.0 g", "一餐参考 ≥ 21.7 g · 还差 3.7 g", true);
-        metric(body, "膳食纤维", "2.5 g", "一餐参考 ≥ 8.3 g · 还差 5.8 g", true);
+        body.addView(txt("本餐每 " + (int) nutrition.getPortionGrams()
+                + " 克营养估算 · " + analysis.getMealLabel(), 15, DARK));
+        body.addView(txt("根据餐品名称离线估算；一餐参考值仅用于点餐比较。", 11, MUTED));
+        metric(body, "能量", formatNumber(nutrition.getKcal()) + " kcal",
+                "一餐参考约 600 kcal · " + energyDifferenceText(nutrition.getKcal()),
+                Math.abs(nutrition.getKcal() - 600) > 100);
+        metric(body, "油脂", formatNumber(nutrition.getFat()) + " g",
+                "一餐参考 ≤ 8.3 g · " + differenceText(nutrition.getFat(), 8.3, true),
+                nutrition.getFat() > 8.3);
+        metric(body, "食盐", formatNumber(nutrition.getSalt()) + " g",
+                "一餐参考 ≤ 1.7 g · " + differenceText(nutrition.getSalt(), 1.7, true),
+                nutrition.getSalt() > 1.7);
+        metric(body, "糖", formatNumber(nutrition.getSugar()) + " g",
+                "一餐参考 ≤ 8.3 g · " + differenceText(nutrition.getSugar(), 8.3, true),
+                nutrition.getSugar() > 8.3);
+        metric(body, "蛋白质", formatNumber(nutrition.getProtein()) + " g",
+                "一餐参考 ≥ 21.7 g · " + differenceText(nutrition.getProtein(), 21.7, false),
+                nutrition.getProtein() < 21.7);
+        metric(body, "膳食纤维", formatNumber(nutrition.getFiber()) + " g",
+                "一餐参考 ≥ 8.3 g · " + differenceText(nutrition.getFiber(), 8.3, false),
+                nutrition.getFiber() < 8.3);
 
-        String allergy = getSharedPreferences("nutriflow", MODE_PRIVATE)
-                .getString("allergy", "无");
-        String taste = getSharedPreferences("nutriflow", MODE_PRIVATE)
-                .getString("taste", "未填写");
-        double budget = readBudget();
         body.addView(txt("本次用户设置核对", 14, DARK));
-        metric(body, "忌口", allergy.contains("无") ? "未发现匹配" : "请核对：" + allergy,
-                "餐品配料以外卖详情为准", !allergy.contains("无"));
+        String allergyValue = analysis.hasAllergyConflict()
+                ? "发现：" + join(analysis.getAllergyHits(), "、") : "未发现匹配";
+        metric(body, "忌口", allergyValue,
+                analysis.hasAllergyConflict() ? "页面文字命中设置中的配料，请谨慎购买" : "未命中设置中的配料关键词",
+                analysis.hasAllergyConflict());
         metric(body, "预算", String.format(Locale.CHINA, "¥%.2f", price),
                 price > budget
                         ? String.format(Locale.CHINA, "超预算 ¥%.2f", price - budget)
                         : String.format(Locale.CHINA, "低于预算 ¥%.2f", budget - price),
                 price > budget);
-        metric(body, "口味", taste, "请对照餐品标签判断辣/甜/清淡差异", false);
-        TextView recommendationTitle = txt("AI 补充建议", 15, DARK);
+        metric(body, "口味", analysis.getTasteResult(), "根据餐品名称和页面标签推断", false);
+        TextView recommendationTitle = txt("补充建议（离线估算）", 15, DARK);
         recommendationTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         recommendationTitle.setPadding(0, dp(12), 0, dp(4));
         body.addView(recommendationTitle);
@@ -396,21 +414,20 @@ public class MealAccessibilityService extends AccessibilityService {
         recommendation.setOrientation(LinearLayout.VERTICAL);
         recommendation.setBackground(rounded(Color.rgb(230, 246, 239), 14));
         recommendation.setPadding(dp(14), dp(12), dp(14), dp(12));
-        TextView recommendationHeading = txt("优先在当前店铺搜索", 13, DARK);
+        TextView recommendationHeading = txt("可先在当前店铺搜索", 13, DARK);
         recommendationHeading.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         recommendation.addView(recommendationHeading);
-        TextView recommendationItems = txt("西兰花或清炒时蔬 120 克 · 约 ¥5.00\n"
-                + "无糖豆浆 250 毫升 · 约 ¥4.00\n"
-                + "预计补充约 168 kcal、蛋白质 11.0 g、膳食纤维 6.4 g", 12, MUTED);
+        TextView recommendationItems = txt(join(analysis.getRecommendations(), "\n"), 12, MUTED);
         recommendationItems.setLineSpacing(0, 1.25f);
         recommendationItems.setPadding(0, dp(5), 0, 0);
         recommendation.addView(recommendationItems);
         body.addView(recommendation);
 
-        double totalPrice = price + 9.0;
+        double recommendationPrice = analysis.getRecommendationPrice();
+        double totalPrice = price + recommendationPrice;
         TextView budgetSummary = txt(String.format(Locale.CHINA,
-                "餐品 ¥%.2f + 推荐搭配 ¥9.00 = ¥%.2f；%s。店内没有同类餐品时，可按上述克数自行补充。",
-                price, totalPrice,
+                "餐品 ¥%.2f + 推荐搭配 ¥%.2f = ¥%.2f；%s。店内没有同类餐品时，可按上述份量自行补充。",
+                price, recommendationPrice, totalPrice,
                 totalPrice > budget
                         ? String.format(Locale.CHINA, "合计超预算 ¥%.2f", totalPrice - budget)
                         : String.format(Locale.CHINA, "合计仍低于预算 ¥%.2f", budget - totalPrice)),
@@ -423,13 +440,17 @@ public class MealAccessibilityService extends AccessibilityService {
         comparisonTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         comparisonTitle.setPadding(0, dp(14), 0, 0);
         body.addView(comparisonTitle);
-        TextView comparisonHint = txt("黄色为当前餐品，绿色为加入推荐后；虚线为对应的一餐参考值。各指标按自身参考值归一化。", 11, MUTED);
+        TextView comparisonHint = txt("黄色为当前餐品，绿色为加入推荐后；虚线为一餐参考值。搭配后的增量也是粗略估算，各指标按自身参考值归一化。", 11, MUTED);
         comparisonHint.setLineSpacing(0, 1.2f);
         body.addView(comparisonHint);
+        double[] current = {nutrition.getKcal(), nutrition.getFat(), nutrition.getSalt(),
+                nutrition.getSugar(), nutrition.getProtein(), nutrition.getFiber()};
+        double[] added = estimateRecommendationNutrition(analysis.getRecommendations());
+        double[] combined = new double[current.length];
+        for (int i = 0; i < current.length; i++) combined[i] = current[i] + added[i];
         NutrientComparisonChart chart = new NutrientComparisonChart(this,
                 new String[]{"能量", "油脂", "盐", "糖", "蛋白质", "纤维"},
-                new double[]{468.0, 8.0, 1.8, 6.0, 18.0, 2.5},
-                new double[]{636.0, 9.1, 2.0, 8.8, 29.0, 8.9},
+                current, combined,
                 new double[]{600.0, 8.3, 1.7, 8.3, 21.7, 8.3});
         body.addView(chart, new LinearLayout.LayoutParams(-1, dp(250)));
 
@@ -439,12 +460,12 @@ public class MealAccessibilityService extends AccessibilityService {
         Button record = action("记录到今日 · "
                 + NutritionLogStore.mealName(NutritionLogStore.mealForHour(
                 java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)))
-                + "（默认 500g）", GREEN);
+                    + "（" + (int) nutrition.getPortionGrams() + "g）", GREEN);
         record.setOnClickListener(v -> {
             String meal = NutritionLogStore.mealName(NutritionLogStore.mealForHour(
                     java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)));
             NutritionLogStore.append(this, NutritionLogStore.todayKey(), meal,
-                    shorten(rawText), 500, price, "跨应用点击");
+                    shorten(rawText), (int) nutrition.getPortionGrams(), price, "跨应用点击");
             record.setText("已记录 ✓");
             record.setEnabled(false);
         });
@@ -484,6 +505,72 @@ public class MealAccessibilityService extends AccessibilityService {
         line.addView(txt(reference, 11, MUTED));
         line.setPadding(0, dp(7), 0, dp(2));
         parent.addView(line);
+    }
+
+    private String formatNumber(double value) {
+        if (Math.abs(value - Math.rint(value)) < 0.01) {
+            return String.format(Locale.CHINA, "%.0f", value);
+        }
+        return String.format(Locale.CHINA, "%.1f", value);
+    }
+
+    private String energyDifferenceText(double value) {
+        if (value > 600) return "超出 " + formatNumber(value - 600) + " kcal";
+        if (value < 600) return "还差 " + formatNumber(600 - value) + " kcal";
+        return "接近参考";
+    }
+
+    private String differenceText(double value, double target, boolean upperLimit) {
+        if (upperLimit) {
+            return value > target ? "超出 " + formatNumber(value - target) + " g" : "未超过";
+        }
+        return value < target ? "还差 " + formatNumber(target - value) + " g" : "已达到";
+    }
+
+    private double[] estimateRecommendationNutrition(java.util.List<String> recommendations) {
+        // Generic item estimates are used only to keep the comparison chart in sync
+        // with the offline recommendation list; they are not merchant nutrition labels.
+        double[] added = new double[6];
+        for (String item : recommendations) {
+            if (item.contains("西兰花") || item.contains("清炒时蔬")) {
+                addNutrition(added, 50, 1.2, 0.25, 2.0, 3.0, 3.5);
+            } else if (item.contains("豆浆")) {
+                addNutrition(added, 90, 3.0, 0.2, 1.5, 7.5, 1.0);
+            } else if (item.contains("水煮蛋")) {
+                addNutrition(added, 75, 5.0, 0.2, 0.2, 6.0, 0);
+            }
+        }
+        return added;
+    }
+
+    private void addNutrition(double[] values, double kcal, double fat, double salt,
+                              double sugar, double protein, double fiber) {
+        values[0] += kcal;
+        values[1] += fat;
+        values[2] += salt;
+        values[3] += sugar;
+        values[4] += protein;
+        values[5] += fiber;
+    }
+
+    private int readPortionGrams(android.content.SharedPreferences preferences) {
+        String raw = preferences.getString("meal_grams", "500");
+        try {
+            int grams = Integer.parseInt(raw.replaceAll("[^0-9]", ""));
+            return Math.max(100, Math.min(1500, grams));
+        } catch (Exception ignored) {
+            return 500;
+        }
+    }
+
+    private String join(java.util.List<String> values, String separator) {
+        if (values == null || values.isEmpty()) return "暂无合适搭配";
+        StringBuilder out = new StringBuilder();
+        for (String value : values) {
+            if (out.length() > 0) out.append(separator);
+            out.append(value);
+        }
+        return out.toString();
     }
 
     private String packageLabel(String pkg) {
