@@ -515,7 +515,15 @@ public class MainActivity extends Activity {
     }
     private void saveProfileV3(String age, String height, String weight, String allergy, String budget, String taste, String type, String grams) { prefs.edit().putBoolean("profile_complete", true).putInt("profile_version", 3).putString("age", age).putString("height", height).putString("weight", weight).putString("allergy", allergy).putString("budget", budget).putString("taste", taste).putString("meal_type", type).putString("meal_grams", grams).apply(); }
     private String p(String key, String fallback) { return prefs.getString(key, fallback); }
-    private double budgetValue() { try { return Double.parseDouble(p("budget", "25").replace("元", "").trim()); } catch (NumberFormatException e) { return 25.0; } }
+    private double budgetValue() {
+        String raw = p("budget", "25");
+        String cleaned = raw.replace("元", "").replace("¥", "")
+                .replaceAll("[^0-9.-]", "").trim();
+        if (cleaned.length() == 0) return raw.contains("弹性") ? 50.0 : 25.0;
+        String[] values = cleaned.split("-");
+        try { return Double.parseDouble(values[values.length - 1]); }
+        catch (NumberFormatException e) { return 25.0; }
+    }
 
     private void showApp(int pageIndex) {
         authPage = false; professionalHome = false;
@@ -825,31 +833,200 @@ public class MainActivity extends Activity {
         deliveryApps = new ArrayList<>(found.values());
     }
     private void showMealAnalysis(String name, String tags, double price, int kcal, int protein) {
-        final Dialog dialog = new Dialog(this); dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        LinearLayout sheet = column(); sheet.setBackground(bg(Color.WHITE, 22)); pad(sheet, 18, 14, 18, 18);
-        LinearLayout top = row(); top.addView(title("餐品营养分析", 19), new LinearLayout.LayoutParams(0, dp(36), 1)); TextView close = text("×", 28, MUTED); close.setGravity(Gravity.CENTER); close.setOnClickListener(v -> dialog.dismiss()); top.addView(close, new LinearLayout.LayoutParams(dp(36), dp(36))); sheet.addView(top);
-        TextView source = text("餐品：" + name + " · 数据按每 100 克估算", 12, MUTED); margin(source, 0, 1, 0, 10); sheet.addView(source);
-        ScrollView scroll = new ScrollView(this); LinearLayout body = column();
-        body.addView(title("每 100 克营养数据", 15)); body.addView(text("正常人一顿饭参考值 = 常用每日参考值 ÷ 3；仅用于点餐比较。", 11, MUTED));
-        addAnalysisRow(body, "油脂", "8.0 g", "≤ 8.3 g", "接近一顿饭上限", false);
-        addAnalysisRow(body, "食盐", "1.8 g", "≤ 1.7 g", "超出 0.1 g", true);
-        addAnalysisRow(body, "添加糖", "6.0 g", "≤ 8.3 g", "未超过", false);
-        addAnalysisRow(body, "蛋白质", protein + ".0 g", "≥ 21.7 g", protein >= 22 ? "达到参考值" : "还差约 " + (22 - protein) + " g", protein < 22);
-        addAnalysisRow(body, "膳食纤维", "2.5 g", "≥ 8.3 g", "还差约 5.8 g", true);
-        body.addView(title("按你的设置核对", 15));
-        String allergy = allergyResult(); addAnalysisRow(body, "忌口检查", allergy, "", allergy.startsWith("发现") ? "请谨慎食用" : "未发现匹配", allergy.startsWith("发现"));
-        double difference = price - budgetValue(); String budgetResult = difference > 0 ? "超预算 " + formatMoney(difference) + " 元" : "低于预算 " + formatMoney(-difference) + " 元"; addAnalysisRow(body, "资金预算", "¥" + formatMoney(price), "预算 ¥" + formatMoney(budgetValue()), budgetResult, difference > 0);
-        addAnalysisRow(body, "口味匹配", tasteResult(tags), "偏好：" + p("taste", "未填写"), "查看差异说明", false);
-        body.addView(title("推荐搭配（按预算分配）", 15));
-        LinearLayout combo = card(); combo.setBackground(stroke(MINT, Color.rgb(183, 225, 207), 14)); combo.addView(text("西兰花 120 克 · ¥5.00\n无糖豆浆 250 ml · ¥4.00\n搭配合计 ¥9.00 · 补充蔬菜、膳食纤维和优质蛋白", 13, DARK)); margin(combo, 0, 7, 0, 0); body.addView(combo);
-        TextView note = text("按预算 ¥" + formatMoney(budgetValue()) + " 计算：餐品 ¥" + formatMoney(price) + " + 推荐搭配 ¥9.00 = ¥" + formatMoney(price + 9.0) + "。如果超出预算，优先保留蔬菜并减少含糖饮料。", 11, MUTED); note.setLineSpacing(0, 1.25f); margin(note, 0, 8, 0, 0); body.addView(note); scroll.addView(body); sheet.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
-        TextView disclaimer = text("营养数据为演示估算，不是餐品标签或医学诊断。", 10, MUTED); disclaimer.setGravity(Gravity.CENTER); margin(disclaimer, 0, 8, 0, 0); sheet.addView(disclaimer);
-        dialog.setContentView(sheet); Window window = dialog.getWindow(); if (window != null) { window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT)); window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND); WindowManager.LayoutParams attrs = window.getAttributes(); attrs.dimAmount = 0.35f; window.setAttributes(attrs); window.setGravity(Gravity.BOTTOM); }
-        dialog.setOnShowListener(d -> { Window shown = dialog.getWindow(); if (shown != null) { shown.setLayout(-1, (int)(getResources().getDisplayMetrics().heightPixels * 0.75f)); shown.setGravity(Gravity.BOTTOM); } }); dialog.show();
+        final Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout sheet = column();
+        sheet.setBackground(bg(Color.WHITE, 22));
+        pad(sheet, 18, 14, 18, 16);
+
+        LinearLayout top = row();
+        top.addView(title("餐品营养分析", 19), new LinearLayout.LayoutParams(0, dp(36), 1));
+        TextView close = text("×", 28, MUTED);
+        close.setGravity(Gravity.CENTER);
+        close.setContentDescription("关闭餐品营养分析");
+        close.setOnClickListener(v -> dialog.dismiss());
+        top.addView(close, new LinearLayout.LayoutParams(dp(36), dp(36)));
+        sheet.addView(top);
+
+        TextView source = text("餐品：" + name + "\n当前按一份约 500 克进行演示估算", 12, MUTED);
+        source.setLineSpacing(0, 1.2f);
+        margin(source, 0, 1, 0, 8);
+        sheet.addView(source);
+
+        double energy = kcal;
+        double oil = 8.0;
+        double salt = 1.8;
+        double sugar = 6.0;
+        double proteinValue = protein;
+        double fiber = 2.5;
+        double[] currentValues = {energy, oil, salt, sugar, proteinValue, fiber};
+        double[] mealTargets = {600.0, 8.3, 1.7, 8.3, 21.7, 8.3};
+
+        double recommendationPrice = 9.0;
+        double[] recommendedValues = {
+                energy + 168.0,
+                oil + 1.1,
+                salt + 0.2,
+                sugar + 2.8,
+                proteinValue + 11.0,
+                fiber + 6.4
+        };
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        LinearLayout body = column();
+        pad(body, 0, 0, 0, 8);
+
+        addAnalysisSectionTitle(body, "本餐每 500 克营养估算", 0);
+        TextView referenceNote = text("一餐参考值按常用每日参考量约三分之一计算，仅用于点餐比较。", 11, MUTED);
+        referenceNote.setLineSpacing(0, 1.2f);
+        body.addView(referenceNote);
+        addAnalysisRow(body, "能量", formatMetric(energy) + " kcal", "约 600 kcal",
+                metricStatus(energy, 600.0, false, "kcal"), energy < 480.0);
+        addAnalysisRow(body, "油脂", formatMetric(oil) + " g", "不高于 8.3 g",
+                metricStatus(oil, 8.3, true, "g"), oil > 8.3);
+        addAnalysisRow(body, "食盐", formatMetric(salt) + " g", "不高于 1.7 g",
+                metricStatus(salt, 1.7, true, "g"), salt > 1.7);
+        addAnalysisRow(body, "添加糖", formatMetric(sugar) + " g", "不高于 8.3 g",
+                metricStatus(sugar, 8.3, true, "g"), sugar > 8.3);
+        addAnalysisRow(body, "蛋白质", formatMetric(proteinValue) + " g", "不少于 21.7 g",
+                metricStatus(proteinValue, 21.7, false, "g"), proteinValue < 21.7);
+        addAnalysisRow(body, "膳食纤维", formatMetric(fiber) + " g", "不少于 8.3 g",
+                metricStatus(fiber, 8.3, false, "g"), fiber < 8.3);
+
+        addAnalysisSectionTitle(body, "按你的设置核对", 14);
+        String allergy = allergyResult(name, tags);
+        boolean allergyWarning = allergy.startsWith("发现");
+        addAnalysisRow(body, "忌口检查", allergy, "以商家配料表为准",
+                allergyWarning ? "请谨慎食用" : "未发现明确匹配", allergyWarning);
+        double budget = budgetValue();
+        double difference = price - budget;
+        String budgetResult = difference > 0
+                ? "超预算 " + formatMoney(difference) + " 元"
+                : "还可使用 " + formatMoney(-difference) + " 元";
+        addAnalysisRow(body, "资金预算", "¥" + formatMoney(price),
+                "本餐预算 ¥" + formatMoney(budget), budgetResult, difference > 0);
+        addAnalysisRow(body, "口味匹配", tasteResult(tags),
+                "偏好：" + p("taste", "未填写"), "已完成差异对照", false);
+
+        addAnalysisSectionTitle(body, "AI 补充建议", 14);
+        LinearLayout combo = card();
+        combo.setBackground(stroke(MINT, Color.rgb(183, 225, 207), 14));
+        TextView comboTitle = title("优先在当前店铺搜索", 14);
+        combo.addView(comboTitle);
+        TextView comboItems = text("西兰花或清炒时蔬 120 克 · 约 ¥5.00\n"
+                + "无糖豆浆 250 毫升 · 约 ¥4.00", 13, DARK);
+        comboItems.setLineSpacing(0, 1.3f);
+        margin(comboItems, 0, 6, 0, 0);
+        combo.addView(comboItems);
+        TextView comboEffect = text("预计补充约 168 kcal、蛋白质 11.0 g、膳食纤维 6.4 g", 11, GREEN);
+        comboEffect.setLineSpacing(0, 1.2f);
+        margin(comboEffect, 0, 7, 0, 0);
+        combo.addView(comboEffect);
+        margin(combo, 0, 6, 0, 0);
+        body.addView(combo);
+
+        double totalPrice = price + recommendationPrice;
+        double totalDifference = totalPrice - budget;
+        String totalBudgetResult = totalDifference > 0
+                ? "合计超预算 " + formatMoney(totalDifference) + " 元"
+                : "合计仍低于预算 " + formatMoney(-totalDifference) + " 元";
+        TextView note = text("餐品 ¥" + formatMoney(price) + " + 推荐搭配 ¥"
+                + formatMoney(recommendationPrice) + " = ¥" + formatMoney(totalPrice)
+                + "，" + totalBudgetResult + "。若店内没有同类餐品，可按该克数自行补充。", 11, MUTED);
+        note.setLineSpacing(0, 1.25f);
+        margin(note, 0, 8, 0, 0);
+        body.addView(note);
+
+        addAnalysisSectionTitle(body, "补充前后营养对比", 14);
+        TextView chartHint = text("黄色表示当前餐品，绿色表示加入推荐食物后；虚线为对应的一餐参考值。各指标按自身参考值归一化显示。", 11, MUTED);
+        chartHint.setLineSpacing(0, 1.2f);
+        body.addView(chartHint);
+        LinearLayout chartCard = card();
+        NutrientComparisonChart chart = new NutrientComparisonChart(this,
+                new String[]{"能量", "油脂", "盐", "糖", "蛋白质", "纤维"},
+                currentValues, recommendedValues, mealTargets);
+        chartCard.addView(chart, new LinearLayout.LayoutParams(-1, dp(250)));
+        TextView chartSummary = text(String.format(Locale.CHINA,
+                "推荐后：能量 %.0f kcal · 蛋白质 %.1f g · 膳食纤维 %.1f g\n"
+                        + "食盐仍约 %.1f g，已超参考值时不因补充食物而隐藏提示。",
+                recommendedValues[0], recommendedValues[4], recommendedValues[5], recommendedValues[2]),
+                11, MUTED);
+        chartSummary.setLineSpacing(0, 1.2f);
+        chartCard.addView(chartSummary);
+        margin(chartCard, 0, 7, 0, 0);
+        body.addView(chartCard);
+
+        scroll.addView(body);
+        sheet.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        TextView disclaimer = text("营养与价格为演示估算，不是商家标签或医学诊断。", 10, MUTED);
+        disclaimer.setGravity(Gravity.CENTER);
+        margin(disclaimer, 0, 7, 0, 0);
+        sheet.addView(disclaimer);
+
+        dialog.setContentView(sheet);
+        Window window = dialog.getWindow();
+        if (window != null) {
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            WindowManager.LayoutParams attrs = window.getAttributes();
+            attrs.dimAmount = 0.35f;
+            window.setAttributes(attrs);
+            window.setGravity(Gravity.BOTTOM);
+        }
+        dialog.setOnShowListener(d -> {
+            Window shown = dialog.getWindow();
+            if (shown != null) {
+                shown.setLayout(-1,
+                        (int) (getResources().getDisplayMetrics().heightPixels * 0.75f));
+                shown.setGravity(Gravity.BOTTOM);
+            }
+        });
+        dialog.show();
+    }
+
+    private void addAnalysisSectionTitle(LinearLayout parent, String value, int topMargin) {
+        TextView heading = title(value, 15);
+        margin(heading, 0, topMargin, 0, 4);
+        parent.addView(heading);
+    }
+
+    private String metricStatus(double value, double target, boolean upperLimit, String unit) {
+        double difference = value - target;
+        if (upperLimit) {
+            return difference > 0.05
+                    ? "超出 " + formatMetric(difference) + " " + unit
+                    : "未超过参考值";
+        }
+        return difference < -0.05
+                ? "还差 " + formatMetric(-difference) + " " + unit
+                : "达到参考值";
+    }
+
+    private String formatMetric(double value) {
+        return Math.abs(value - Math.rint(value)) < 0.05
+                ? String.format(Locale.CHINA, "%.0f", value)
+                : String.format(Locale.CHINA, "%.1f", value);
     }
     private void addAnalysisRow(LinearLayout parent, String label, String value, String reference, String result, boolean warning) { LinearLayout r = column(); margin(r, 0, 8, 0, 0); LinearLayout first = row(); first.addView(title(label, 13), new LinearLayout.LayoutParams(0, dp(24), 1)); TextView valueText = text(value, 13, warning ? ORANGE : GREEN); valueText.setTypeface(Typeface.DEFAULT, Typeface.BOLD); first.addView(valueText, new LinearLayout.LayoutParams(-2, dp(24))); r.addView(first); LinearLayout second = row(); second.addView(text(reference, 11, MUTED), new LinearLayout.LayoutParams(0, dp(22), 1)); TextView resultText = text(result, 11, warning ? ORANGE : MUTED); resultText.setGravity(Gravity.RIGHT); second.addView(resultText, new LinearLayout.LayoutParams(-2, dp(22))); r.addView(second); parent.addView(r);
     }
-    private String allergyResult() { String a = p("allergy", "无").trim(); if (a.length() == 0 || "无".equals(a)) return "未发现设置中的忌口"; String ingredients = "鸡肉、鸡蛋、乳制品、芝麻、香辛料、面粉"; for (String token : a.split("[、,，;； ]+")) if (token.length() > 0 && ingredients.contains(token)) return "发现：" + token; return "未发现设置中的忌口"; }
+    private String allergyResult(String name, String tags) {
+        String allergy = p("allergy", "无").trim();
+        if (allergy.length() == 0 || "无".equals(allergy)) return "未设置忌口";
+        String foodText = name + " " + tags;
+        for (String token : allergy.split("[、,，;； ]+")) {
+            if (token.length() == 0) continue;
+            boolean matched = foodText.contains(token)
+                    || (token.contains("鸡") && foodText.contains("鸡"))
+                    || (token.contains("虾") && foodText.contains("虾"))
+                    || (token.contains("牛") && foodText.contains("牛"))
+                    || (token.contains("奶") && (foodText.contains("乳") || foodText.contains("奶")));
+            if (matched) return "发现：" + token;
+        }
+        return "未发现明确匹配";
+    }
     private String tasteResult(String tags) { String taste = p("taste", "未填写"); if (taste.contains("辣") && tags.contains("辣")) return "匹配：你的偏好含辣，餐品为" + tags; if ((taste.contains("清淡") || taste.contains("少油")) && (tags.contains("咸") || tags.contains("香辣"))) return "差异：餐品偏咸偏辣，可能比清淡偏好重"; if (taste.contains("甜") && tags.contains("甜")) return "匹配：你的偏好偏甜，餐品含甜味"; return "差异：餐品为" + tags + "，请结合个人口味选择"; }
     private String formatMoney(double value) { return String.format(Locale.CHINA, "%.2f", value); }
     private void showProfileEdit(){

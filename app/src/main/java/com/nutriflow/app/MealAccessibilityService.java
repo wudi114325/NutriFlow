@@ -363,13 +363,15 @@ public class MealAccessibilityService extends AccessibilityService {
         ScrollView scroll = new ScrollView(this);
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
-        body.addView(txt("每 100 克指标 · 一餐参考值按日摄入量 ÷ 3", 14, DARK));
-        metric(body, "能量", "120 kcal", "一餐参考约 600 kcal", false);
-        metric(body, "油脂", "2.4 g", "一餐参考 ≤ 8.3 g", false);
-        metric(body, "食盐", "0.6 g", "一餐参考 ≤ 1.7 g", false);
-        metric(body, "糖", "2.0 g", "一餐参考 ≤ 8.3 g", false);
-        metric(body, "蛋白质", "5.5 g", "一餐参考 ≥ 21.7 g", true);
-        metric(body, "膳食纤维", "1.8 g", "一餐参考 ≥ 8.3 g", true);
+        body.setPadding(0, 0, 0, dp(8));
+        body.addView(txt("本餐每 500 克营养估算", 15, DARK));
+        body.addView(txt("一餐参考值按常用每日参考量约三分之一计算，仅用于点餐比较。", 11, MUTED));
+        metric(body, "能量", "468 kcal", "一餐参考约 600 kcal · 还差 132 kcal", true);
+        metric(body, "油脂", "8.0 g", "一餐参考 ≤ 8.3 g · 未超过", false);
+        metric(body, "食盐", "1.8 g", "一餐参考 ≤ 1.7 g · 超出 0.1 g", true);
+        metric(body, "添加糖", "6.0 g", "一餐参考 ≤ 8.3 g · 未超过", false);
+        metric(body, "蛋白质", "18.0 g", "一餐参考 ≥ 21.7 g · 还差 3.7 g", true);
+        metric(body, "膳食纤维", "2.5 g", "一餐参考 ≥ 8.3 g · 还差 5.8 g", true);
 
         String allergy = getSharedPreferences("nutriflow", MODE_PRIVATE)
                 .getString("allergy", "无");
@@ -385,7 +387,51 @@ public class MealAccessibilityService extends AccessibilityService {
                         : String.format(Locale.CHINA, "低于预算 ¥%.2f", budget - price),
                 price > budget);
         metric(body, "口味", taste, "请对照餐品标签判断辣/甜/清淡差异", false);
-        body.addView(txt("推荐搭配：西兰花 120 克（约 ¥5）+ 无糖豆浆 250 ml（约 ¥4），补充蔬菜、纤维和蛋白质。", 12, MUTED));
+        TextView recommendationTitle = txt("AI 补充建议", 15, DARK);
+        recommendationTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        recommendationTitle.setPadding(0, dp(12), 0, dp(4));
+        body.addView(recommendationTitle);
+
+        LinearLayout recommendation = new LinearLayout(this);
+        recommendation.setOrientation(LinearLayout.VERTICAL);
+        recommendation.setBackground(rounded(Color.rgb(230, 246, 239), 14));
+        recommendation.setPadding(dp(14), dp(12), dp(14), dp(12));
+        TextView recommendationHeading = txt("优先在当前店铺搜索", 13, DARK);
+        recommendationHeading.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        recommendation.addView(recommendationHeading);
+        TextView recommendationItems = txt("西兰花或清炒时蔬 120 克 · 约 ¥5.00\n"
+                + "无糖豆浆 250 毫升 · 约 ¥4.00\n"
+                + "预计补充约 168 kcal、蛋白质 11.0 g、膳食纤维 6.4 g", 12, MUTED);
+        recommendationItems.setLineSpacing(0, 1.25f);
+        recommendationItems.setPadding(0, dp(5), 0, 0);
+        recommendation.addView(recommendationItems);
+        body.addView(recommendation);
+
+        double totalPrice = price + 9.0;
+        TextView budgetSummary = txt(String.format(Locale.CHINA,
+                "餐品 ¥%.2f + 推荐搭配 ¥9.00 = ¥%.2f；%s。店内没有同类餐品时，可按上述克数自行补充。",
+                price, totalPrice,
+                totalPrice > budget
+                        ? String.format(Locale.CHINA, "合计超预算 ¥%.2f", totalPrice - budget)
+                        : String.format(Locale.CHINA, "合计仍低于预算 ¥%.2f", budget - totalPrice)),
+                11, MUTED);
+        budgetSummary.setLineSpacing(0, 1.2f);
+        budgetSummary.setPadding(0, dp(7), 0, 0);
+        body.addView(budgetSummary);
+
+        TextView comparisonTitle = txt("补充前后营养对比", 15, DARK);
+        comparisonTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        comparisonTitle.setPadding(0, dp(14), 0, 0);
+        body.addView(comparisonTitle);
+        TextView comparisonHint = txt("黄色为当前餐品，绿色为加入推荐后；虚线为对应的一餐参考值。各指标按自身参考值归一化。", 11, MUTED);
+        comparisonHint.setLineSpacing(0, 1.2f);
+        body.addView(comparisonHint);
+        NutrientComparisonChart chart = new NutrientComparisonChart(this,
+                new String[]{"能量", "油脂", "盐", "糖", "蛋白质", "纤维"},
+                new double[]{468.0, 8.0, 1.8, 6.0, 18.0, 2.5},
+                new double[]{636.0, 9.1, 2.0, 8.8, 29.0, 8.9},
+                new double[]{600.0, 8.3, 1.7, 8.3, 21.7, 8.3});
+        body.addView(chart, new LinearLayout.LayoutParams(-1, dp(250)));
 
         scroll.addView(body);
         sheet.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
