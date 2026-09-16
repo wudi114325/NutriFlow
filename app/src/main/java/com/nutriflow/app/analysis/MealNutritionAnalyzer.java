@@ -27,8 +27,17 @@ public final class MealNutritionAnalyzer {
         List<String> allergyHits = findAllergyHits(evidence, allergy);
         String tasteResult = tasteResult(evidence, taste);
         double budgetLimit = parseBudgetLimit(budget);
-        double comboPrice = recommendedPrice(template, budgetLimit - price);
-        List<String> recommendations = recommendations(template, comboPrice);
+        List<RecommendationItem> selected = selectRecommendations(
+                template, Math.max(0, budgetLimit - price), allergy);
+        double comboPrice = 0;
+        List<String> recommendations = new ArrayList<>();
+        for (RecommendationItem item : selected) {
+            comboPrice += item.price;
+            recommendations.add(item.label);
+        }
+        if (recommendations.isEmpty()) {
+            recommendations.add("预算或忌口限制下暂无合适搭配，请核对配料后选择");
+        }
         return new Result(nutrition, allergyHits, tasteResult, budgetLimit,
                 comboPrice, recommendations, template.label);
     }
@@ -55,8 +64,8 @@ public final class MealNutritionAnalyzer {
 
     private static List<String> findAllergyHits(String text, String allergy) {
         List<String> hits = new ArrayList<>();
-        if (allergy == null || allergy.trim().length() == 0 || allergy.contains("无")) return hits;
-        String[] tokens = allergy.split("[、,，;；/\\s]+", -1);
+        if (allergy == null || allergy.trim().length() == 0 || isNoRestriction(allergy)) return hits;
+        String[] tokens = allergy.split("[、,，;；/\\s和及与]+", -1);
         for (String token : tokens) {
             String clean = token.trim().toLowerCase(Locale.CHINA)
                     .replace("过敏", "").replace("忌口", "")
@@ -73,9 +82,17 @@ public final class MealNutritionAnalyzer {
         return new ArrayList<>(new LinkedHashSet<>(hits));
     }
 
+    private static boolean isNoRestriction(String value) {
+        String clean = value.trim();
+        return clean.equals("无") || clean.equals("没有") || clean.equals("暂无")
+                || clean.equals("无忌口") || clean.equals("无过敏") || clean.equals("不忌口");
+    }
+
     private static String[] aliases(String token) {
         if (token.contains("奶") || token.contains("乳")) return new String[]{token, "牛奶", "乳制品", "奶油", "芝士", "奶酪"};
-        if (token.contains("蛋")) return new String[]{token, "鸡蛋", "蛋液", "蛋黄"};
+        if (token.contains("蛋")) return new String[]{token, "鸡蛋", "水煮蛋", "蛋液", "蛋黄", "蛋"};
+        if (token.contains("豆")) return new String[]{token, "大豆", "黄豆", "豆浆", "豆腐", "豆制品"};
+        if (token.contains("蔬菜") || token.contains("时蔬")) return new String[]{token, "蔬菜", "时蔬", "西兰花"};
         if (token.contains("花生")) return new String[]{token, "花生", "坚果"};
         if (token.contains("麸")) return new String[]{token, "面粉", "小麦", "面包"};
         if (token.contains("海鲜") || token.contains("鱼")) return new String[]{token, "鱼", "虾", "蟹", "海鲜"};
@@ -111,40 +128,24 @@ public final class MealNutritionAnalyzer {
         return 25.0;
     }
 
-    private static double recommendedPrice(Template template, double remaining) {
-        if (remaining < 3.0) return 0;
-        if (template.category.equals("甜饮/甜品")) {
-            if (remaining >= 7.0) return 7.0;
-            if (remaining >= 4.0) return 4.0;
-            return 3.0;
+    private static List<RecommendationItem> selectRecommendations(
+            Template template, double remaining, String allergy) {
+        List<RecommendationItem> candidates = new ArrayList<>();
+        if (!template.category.equals("甜饮/甜品")
+                && !template.category.equals("蔬菜轻食")) {
+            candidates.add(new RecommendationItem("西兰花或清炒时蔬 120 克 · 约 ¥5.00", 5));
         }
-        if (template.category.equals("蔬菜轻食")) return remaining >= 4.0 ? 4.0 : 3.0;
-        if (remaining >= 9.0) return 9.0;
-        if (remaining >= 5.0) return 5.0;
-        if (remaining >= 4.0) return 4.0;
-        return 3.0;
-    }
+        candidates.add(new RecommendationItem("无糖豆浆 250 毫升 · 约 ¥4.00", 4));
+        candidates.add(new RecommendationItem("水煮蛋 1 个 · 约 ¥3.00", 3));
 
-    private static List<String> recommendations(Template template, double price) {
-        List<String> items = new ArrayList<>();
-        if (price < 3.0) {
-            items.add("当前餐品已达到预算上限，暂不增加搭配");
-            return items;
+        List<RecommendationItem> selected = new ArrayList<>();
+        for (RecommendationItem item : candidates) {
+            if (remaining + 0.001 < item.price) continue;
+            if (!findAllergyHits(item.label, allergy).isEmpty()) continue;
+            selected.add(item);
+            remaining -= item.price;
         }
-        if (template.category.equals("甜饮/甜品")) {
-            if (price >= 4.0) items.add("无糖豆浆 250 毫升 · 约 ¥4.00");
-            if (price >= 7.0) items.add("水煮蛋 1 个 · 约 ¥3.00");
-            if (price == 3.0) items.add("水煮蛋 1 个 · 约 ¥3.00");
-        } else if (template.category.equals("蔬菜轻食")) {
-            if (price >= 4.0) items.add("无糖豆浆 250 毫升 · 约 ¥4.00");
-            else items.add("水煮蛋 1 个 · 约 ¥3.00");
-        } else {
-            if (price >= 5.0) items.add("西兰花或清炒时蔬 120 克 · 约 ¥5.00");
-            if (price >= 9.0) items.add("无糖豆浆 250 毫升 · 约 ¥4.00");
-            if (price == 4.0) items.add("无糖豆浆 250 毫升 · 约 ¥4.00");
-            if (price == 3.0) items.add("水煮蛋 1 个 · 约 ¥3.00");
-        }
-        return items;
+        return selected;
     }
 
     private static boolean containsAny(String text, String... values) {
@@ -160,6 +161,15 @@ public final class MealNutritionAnalyzer {
                  double sugar, double protein, double fiber) {
             this.category = category; this.label = label; this.kcal = kcal; this.fat = fat;
             this.salt = salt; this.sugar = sugar; this.protein = protein; this.fiber = fiber;
+        }
+    }
+
+    private static final class RecommendationItem {
+        final String label;
+        final double price;
+        RecommendationItem(String label, double price) {
+            this.label = label;
+            this.price = price;
         }
     }
 
