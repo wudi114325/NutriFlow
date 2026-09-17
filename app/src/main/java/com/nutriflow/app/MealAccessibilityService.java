@@ -56,6 +56,9 @@ public class MealAccessibilityService extends AccessibilityService {
     private String sessionPackage = "";
     private String overlayKey = "";
     private boolean recognitionEnabled;
+    private String recognitionStatus = "等待菜品";
+    private int readFailures;
+    private static final String TAG = "NutriFlowRecognition";
 
     @Override
     protected void onServiceConnected() {
@@ -77,7 +80,18 @@ public class MealAccessibilityService extends AccessibilityService {
         info.packageNames = null;
         info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                 | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
-        setServiceInfo(info);
+        try {
+            setServiceInfo(info);
+        } catch (RuntimeException failure) {
+            // Some OEMs reject interactive-window retrieval; active-root scanning
+            // can still work. Do not crash and leave a dead enabled service.
+            info.flags &= ~AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+            try { setServiceInfo(info); }
+            catch (RuntimeException retryFailure) { logFailure("connect", retryFailure); }
+        }
+        sessionPackage = DeliveryLaunch.restore(this);
+        if (!isDeliveryPackage(sessionPackage)) sessionPackage = "";
+        if (!sessionPackage.isEmpty()) scheduleScan(350);
     }
 
     @Override
@@ -106,7 +120,18 @@ public class MealAccessibilityService extends AccessibilityService {
         if (pendingScan != null) return;
         pendingScan = () -> {
             pendingScan = null;
-            inspectForeground();
+            try {
+                inspectForeground();
+            } catch (RuntimeException failure) {
+                // Accessibility nodes/windows can become invalid between IPC calls.
+                // Recover on a later frame rather than terminating the service.
+                logFailure("scan", failure);
+                cancelPendingScan();
+                removeOverlay();
+                readFailures++;
+                setRecognitionStatus(readFailures <= 3 ? "读取中" : "请重试");
+                if (readFailures <= 3) scheduleScan(1500);
+            }
         };
         handler.postDelayed(pendingScan, delay);
     }
@@ -117,121 +142,199 @@ public class MealAccessibilityService extends AccessibilityService {
     }
 
     private void inspectForeground() {
-        AccessibilityNodeInfo root = getRootInActiveWindow();
+        android.app.KeyguardManager lock = (android.app.KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+        android.os.PowerManager power = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+        if ((lock != null && lock.isKeyguardLocked()) || (power != null && !power.isInteractive())) {
+            hideSessionViews(true);
+            return;
+        }
+        AccessibilityNodeInfo root = deliveryRoot();
         if (root == null) {
-            hideSessionViews();
+            // A loading frame or touching our own overlay is not a new visit.
+            hideSessionViews(false);
+            if (++readFailures <= 3) scheduleScan(1000);
             return;
         }
         try {
             String pkg = root.getPackageName() == null ? "" : root.getPackageName().toString();
-            android.app.KeyguardManager lock = (android.app.KeyguardManager) getSystemService(KEYGUARD_SERVICE);
-            android.os.PowerManager power = (android.os.PowerManager) getSystemService(POWER_SERVICE);
-            if (!sessionPackage.equals(pkg) || !isDeliveryWindowFocused()
-                    || (lock != null && lock.isKeyguardLocked())
-                    || (power != null && !power.isInteractive())) {
-                hideSessionViews();
+            if (!sessionPackage.equals(pkg)) {
+                hideSessionViews(true);
                 return;
             }
             showRecognitionToggle();
-            if (!recognitionEnabled) return;
+            if (!recognitionEnabled) { readFailures = 0; return; }
             android.graphics.Rect bounds = new android.graphics.Rect();
             root.getBoundsInScreen(bounds);
             ScanBudget budget = new ScanBudget();
             Scope scope = readScope(root, bounds, budget, 0);
-            FoodDetailDetector.Result detail = budget.nodes > 600 || budget.characters > 18000
-                    ? null : scope.detail;
-            String key = detail == null ? "" : pkg + ":" + root.getWindowId() + ":" + detail.foodName;
+            readFailures = 0;
+            // A complete foreground sheet remains usable if its background menu
+            // exceeded the budget. Never infer a result from a truncated scope.
+            FoodDetailDetector.Result detail = scope.detail;
+            if (detail == null && !scope.complete) {
+                removeOverlay();
+                setRecognitionStatus("读取中");
+                return;
+            }
+            String key = detail == null ? "" : pkg + ":" + FoodDetailDetector.identity(detail.foodName);
             boolean ready = visits.observe(key, android.os.SystemClock.uptimeMillis());
             if (detail == null || (!overlayKey.isEmpty() && !overlayKey.equals(key))) removeOverlay();
+            setRecognitionStatus(detail == null ? "等待菜品" : "已识别");
             if (detail != null && ready && overlay == null) {
                 showOverlay(detail.foodName, detail.evidence, detail.price, pkg);
                 if (overlay != null) {
                     overlayKey = key;
                     visits.markShown(key);
+                } else {
+                    setRecognitionStatus("请重试");
                 }
             }
         } finally {
-            root.recycle();
-            // Also detects leaving a detail/app when the client emits no useful event.
-            // When disabled, this poll checks only the foreground package, never page text.
-            if (recognitionToggle != null) scheduleScan(750);
+            recycle(root);
+            if (recognitionToggle != null) scheduleScan(1000);
         }
     }
 
-    private boolean isDeliveryWindowFocused() {
-        java.util.List<android.view.accessibility.AccessibilityWindowInfo> windows = getWindows();
-        boolean matches = true;
-        for (android.view.accessibility.AccessibilityWindowInfo window : windows) {
-            try {
-                if (!window.isFocused() || window.getType()
+    private AccessibilityNodeInfo deliveryRoot() {
+        // Touching TYPE_ACCESSIBILITY_OVERLAY may make it the active window on
+        // some phones. Select the actual focused application, excluding our UI.
+        java.util.List<android.view.accessibility.AccessibilityWindowInfo> windows = null;
+        AccessibilityNodeInfo focusedRoot = null;
+        AccessibilityNodeInfo activeRoot = null;
+        try {
+            windows = getWindows();
+            if (windows != null) for (android.view.accessibility.AccessibilityWindowInfo window : windows) {
+                if (window == null || window.getType()
                         == android.view.accessibility.AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue;
-                AccessibilityNodeInfo focused = window.getRoot();
-                if (focused != null) {
-                    try {
-                        if (!sessionPackage.contentEquals(focused.getPackageName() == null
-                                ? "" : focused.getPackageName())) matches = false;
-                    } finally { focused.recycle(); }
+                if (!window.isFocused() && !window.isActive()) continue;
+                AccessibilityNodeInfo candidate = window.getRoot();
+                if (candidate == null) continue;
+                if (window.isFocused()) {
+                    recycle(focusedRoot);
+                    focusedRoot = candidate;
+                } else {
+                    recycle(activeRoot);
+                    activeRoot = candidate;
                 }
-            } finally { window.recycle(); }
+            }
+        } catch (RuntimeException failure) {
+            logFailure("windows", failure);
+        } finally {
+            if (windows != null) for (android.view.accessibility.AccessibilityWindowInfo window : windows) {
+                if (window != null) try { window.recycle(); } catch (RuntimeException ignored) { }
+            }
         }
-        return matches;
+        if (focusedRoot != null) {
+            recycle(activeRoot);
+            // Returning the foreign focused root lets the caller hide immediately.
+            return focusedRoot;
+        }
+        AccessibilityNodeInfo root = null;
+        try {
+            root = getRootInActiveWindow();
+            if (root != null && !getPackageName().contentEquals(root.getPackageName() == null ? "" : root.getPackageName())) {
+                recycle(activeRoot);
+                return root;
+            }
+        } catch (RuntimeException failure) {
+            logFailure("active-window", failure);
+        }
+        recycle(root);
+        return activeRoot;
     }
 
-    private static final class ScanBudget { int nodes; int characters; }
+    private static void recycle(AccessibilityNodeInfo node) {
+        if (node != null) try { node.recycle(); } catch (RuntimeException ignored) { }
+    }
+
+    private void logFailure(String stage, RuntimeException failure) {
+        // Do not retain page text, food names, or exception messages from another app.
+        android.util.Log.w(TAG, stage + ": " + failure.getClass().getSimpleName());
+    }
+
+    private static final class ScanBudget {
+        int nodes; int characters;
+        final long deadline = android.os.SystemClock.uptimeMillis() + 250;
+        boolean exhausted() {
+            return nodes >= 1000 || characters >= 24000 || android.os.SystemClock.uptimeMillis() > deadline;
+        }
+    }
     private static final class Scope {
         final java.util.List<String> lines = new java.util.ArrayList<>();
         FoodDetailDetector.Result detail;
         boolean ambiguous;
+        boolean complete = true;
     }
 
     private Scope readScope(AccessibilityNodeInfo node, android.graphics.Rect screen,
                             ScanBudget budget, int depth) {
         Scope result = new Scope();
-        if (depth > 24 || budget.nodes++ > 600 || budget.characters > 18000
-                || !node.isVisibleToUser()) return result;
+        if (depth > 40 || budget.exhausted()) { result.complete = false; return result; }
+        budget.nodes++;
+        // Don't prune invisible/zero-sized container nodes: WebViews sometimes
+        // report those for parents whose visible children contain the food title.
         android.graphics.Rect rect = new android.graphics.Rect();
         node.getBoundsInScreen(rect);
-        if (!android.graphics.Rect.intersects(screen, rect)) return result;
-        addText(result.lines, node.getText(), budget);
-        if (node.getContentDescription() != null
-                && !node.getContentDescription().toString().contentEquals(
-                        node.getText() == null ? "" : node.getText())) {
-            addText(result.lines, node.getContentDescription(), budget);
+        if (node.isVisibleToUser() && android.graphics.Rect.intersects(screen, rect)) {
+            addText(result.lines, node.getText(), budget);
+            if (node.getContentDescription() != null
+                    && !node.getContentDescription().toString().contentEquals(
+                            node.getText() == null ? "" : node.getText())) {
+                addText(result.lines, node.getContentDescription(), budget);
+            }
+            String id = node.getViewIdResourceName();
+            if (id != null && node.isClickable()) {
+                String localId = id.substring(id.lastIndexOf('/') + 1).toLowerCase(Locale.ROOT);
+                if (localId.matches("(?:[a-z]+_)*(?:close|dismiss)(?:_[a-z]+)*")) addText(result.lines, "关闭", budget);
+                else if (localId.matches("(?:[a-z]+_)*back(?:_[a-z]+)*")) addText(result.lines, "返回", budget);
+            }
         }
-        int count = Math.min(node.getChildCount(), 80);
-        for (int i = 0; i < count; i++) {
+        int count = node.getChildCount();
+        java.util.List<String> childLines = new java.util.ArrayList<>();
+        // Modal sheets are commonly appended after a large background menu.
+        for (int i = count - 1; i >= 0; i--) {
+            if (budget.exhausted()) { result.complete = false; break; }
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child == null) continue;
+            if (child == null) { result.complete = false; continue; }
             try {
                 Scope sub = readScope(child, screen, budget, depth + 1);
-                result.lines.addAll(sub.lines);
-                // A foreground detail sheet may have a still-visible menu behind it.
-                // Use a complete detail container instead of mixing its background text.
+                childLines.addAll(0, sub.lines);
+                result.complete &= sub.complete;
                 if (sub.ambiguous) result.ambiguous = true;
                 if (sub.detail != null) {
-                    if (result.detail != null && !result.detail.foodName.equals(sub.detail.foodName)) {
-                        result.ambiguous = true;
-                    }
+                    // A complete closeable foreground sheet excludes background
+                    // menu evidence and avoids traversing hundreds of menu nodes.
+                    if (sub.detail.dismissible) { result.detail = sub.detail; return result; }
+                    if (result.detail != null && !FoodDetailDetector.identity(result.detail.foodName)
+                            .equals(FoodDetailDetector.identity(sub.detail.foodName))) result.ambiguous = true;
                     result.detail = sub.detail;
                 }
-            } finally { child.recycle(); }
+            } finally { recycle(child); }
         }
+        result.lines.addAll(childLines);
         if (result.ambiguous) { result.detail = null; return result; }
-        if (result.detail == null && rect.width() >= screen.width() * 0.65f
-                && rect.height() >= screen.height() * 0.35f) {
+        boolean usableBounds = rect.isEmpty() || (rect.width() >= screen.width() * 0.55f
+                && rect.height() >= screen.height() * 0.20f);
+        if (result.detail == null && result.complete && usableBounds && !result.lines.isEmpty()) {
             result.detail = FoodDetailDetector.detect(result.lines);
         }
         return result;
     }
 
     private void addText(java.util.List<String> lines, CharSequence raw, ScanBudget budget) {
-        if (raw == null || raw.length() > 1200) return;
+        if (raw == null || raw.length() > 4000) return;
         for (String part : raw.toString().split("[\\n\\r|•]+")) {
             String text = part.trim();
-            if (text.isEmpty() || text.length() > 180) continue;
+            if (text.isEmpty() || text.length() > 1000) continue;
             budget.characters += text.length();
             lines.add(text);
         }
+    }
+
+    private void setRecognitionStatus(String status) {
+        if (status.equals(recognitionStatus)) return;
+        recognitionStatus = status;
+        updateToggle();
     }
 
     private void showRecognitionToggle() {
@@ -250,8 +353,20 @@ public class MealAccessibilityService extends AccessibilityService {
             cancelPendingScan();
             removeOverlay();
             visits.reset();
+            readFailures = 0;
+            recognitionStatus = "等待菜品";
             updateToggle();
             scheduleScan(180);
+        });
+        recognitionToggle.setOnLongClickListener(v -> {
+            if (!recognitionEnabled) return false;
+            removeOverlay();
+            visits.reset();
+            readFailures = 0;
+            setRecognitionStatus("读取中");
+            cancelPendingScan();
+            scheduleScan(180);
+            return true;
         });
         updateToggle();
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(dp(112), dp(48),
@@ -268,16 +383,18 @@ public class MealAccessibilityService extends AccessibilityService {
 
     private void updateToggle() {
         if (recognitionToggle == null) return;
-        recognitionToggle.setText("◉ 营养流\n" + (recognitionEnabled ? "识别已开" : "识别已关"));
+        recognitionToggle.setText("◉ 营养流\n" + (recognitionEnabled ? "已开·" + recognitionStatus : "识别已关"));
         recognitionToggle.setBackground(rounded(recognitionEnabled ? GREEN : MUTED, 16));
         recognitionToggle.setContentDescription(recognitionEnabled
-                ? "营养流识别已开启，点击关闭" : "营养流识别已关闭，点击开启");
+                ? "营养流识别已开启，" + recognitionStatus + "，点击关闭，长按重新识别" : "营养流识别已关闭，点击开启");
     }
 
-    private void hideSessionViews() {
+    private void hideSessionViews() { hideSessionViews(true); }
+
+    private void hideSessionViews(boolean resetVisit) {
         cancelPendingScan();
         removeOverlay();
-        visits.reset();
+        if (resetVisit) visits.reset();
         if (recognitionToggle != null && windowManager != null) {
             try { windowManager.removeView(recognitionToggle); } catch (RuntimeException ignored) { }
             recognitionToggle = null;

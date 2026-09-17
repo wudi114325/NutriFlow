@@ -777,16 +777,16 @@ public class MainActivity extends Activity {
         page.addView(intro);
         LinearLayout access = card();
         access.addView(title("跨应用餐品分析", 15));
-        TextView accessText = text(isAccessibilityEnabled() ? "权限已开启：从营养流打开外卖 App，点击左上角“营养流”开关开启识别，再进入食品详情查看营养估算。首次默认关闭。" : "尚未开启。Android 需要你在系统设置中主动授权，营养流才可以在外卖 App 的餐品页面显示分析。", 12, MUTED);
+        TextView accessText = text(isAccessibilityEnabled() ? "权限已开启：从营养流打开外卖 App，点击左上角“营养流”开关开启识别，再进入食品详情查看营养估算。首次默认关闭，长按开关可重试。" : "尚未开启。请在系统设置中主动授权。若开关灰色、开启后无反应，请查看下方“开启帮助”。", 12, MUTED);
         accessText.setLineSpacing(0, 1.25f);
         margin(accessText, 0, 4, 0, 8);
         access.addView(accessText);
         Button accessButton = primary(isAccessibilityEnabled() ? "打开系统设置查看权限" : "开启跨应用分析权限");
-        accessButton.setOnClickListener(v -> {
-            try { startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); }
-            catch (Exception e) { Toast.makeText(this, "无法打开系统无障碍设置，请在手机设置中搜索“无障碍”", Toast.LENGTH_LONG).show(); }
-        });
+        accessButton.setOnClickListener(v -> com.nutriflow.app.analysis.AccessibilitySupport.openSettings(this));
         access.addView(accessButton);
+        Button accessHelp = outline("开启帮助 / 开关灰色或无反应");
+        accessHelp.setOnClickListener(v -> com.nutriflow.app.analysis.AccessibilitySupport.showHelp(this));
+        access.addView(accessHelp);
         margin(access, 0, 0, 0, 12);
         page.addView(access);
         for (final DeliveryApp app : deliveryApps) {
@@ -799,8 +799,7 @@ public class MainActivity extends Activity {
     }
 
     private boolean isAccessibilityEnabled() {
-        String enabled = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-        return enabled != null && enabled.toLowerCase(Locale.CHINA).contains(getPackageName().toLowerCase(Locale.CHINA));
+        return com.nutriflow.app.analysis.AccessibilitySupport.isEnabled(this);
     }
     private void openDeliveryApp(DeliveryApp app) {
         Intent launch = getPackageManager().getLaunchIntentForPackage(app.packageName);

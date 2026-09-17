@@ -50,6 +50,54 @@ public final class RecognitionRegression {
         check(analysis.getRecommendationPrice() == 0, "unknown price does not create budget allowance");
         check(analysis.getRecommendations().get(0).contains("未识别"), "unknown price explanation");
 
+        // Representative Android delivery detail layouts. These are authored
+        // fixtures, not claimed to be captured accessibility trees from a phone.
+        for (String action : new String[]{"加购", "选好了", "选好啦", "加入餐车", "添加到购物车", "立即购买", "＋", "增加数量"}) {
+            detail = page("关闭", "香辣鸡腿堡", "月售100+", "¥12.90", action);
+            check(detail != null && detail.foodName.equals("香辣鸡腿堡"), "no literal detail heading: " + action);
+        }
+        detail = page("返回", "商品", "评价", "详情", "手枪腿", "¥19", "立即购买");
+        check(detail != null && detail.foodName.equals("手枪腿"), "separate ecommerce tabs");
+        detail = page("返回", "奥尔良鸡肉卷", "￥15", "已选", "规格", "加入餐车");
+        check(detail != null, "full page with selected specification");
+        detail = page("返回", "七鲜牛肉水饺", "￥29.9", "客服", "店铺", "购物车", "立即购买");
+        check(detail != null, "ecommerce detail toolbar");
+        detail = page("商品详情", "【招牌】香辣鸡腿堡", "香辣鸡腿堡 月售123 好评率99% ￥12", "加购");
+        check(detail != null && detail.foodName.equals("香辣鸡腿堡"), "deduplicate decorated and sales title");
+        check(detail != null && detail.price == 12, "price in combined accessible label");
+        detail = page("商品详情", "香辣鸡腿堡", "香辣鸡腿堡，月售100+，好评率99%，￥12.90", "加购");
+        check(detail != null && detail.price == 12.90, "punctuated duplicate description");
+        detail = page("关闭", "￥18，卤肉饭 月售12 立即购买");
+        check(detail != null && detail.foodName.equals("卤肉饭"), "price before food in combined node");
+        check(detail != null && detail.price == 18, "combined node price preserved");
+        detail = page("关闭", "卤肉饭", "卤肉饭 ￥18 选好了");
+        check(detail != null && detail.foodName.equals("卤肉饭"), "purchase action removed from duplicate title");
+        check(page("返回", "牛肉饭", "￥20", "数量", "去结算") == null, "checkout is not a food detail action");
+        detail = page("关闭\n商品名称：卤肉饭 月售12\n￥18\n选好了");
+        check(detail != null && detail.foodName.equals("卤肉饭"), "multiline accessible node");
+        detail = page("选择规格", "香辣鸡腿堡", "¥18", "口味", "原味", "香辣", "加料", "鸡蛋", "牛肉", "选好了");
+        check(detail != null && detail.foodName.equals("香辣鸡腿堡"), "options are not competing product titles");
+        check(detail != null && !detail.evidence.contains("牛肉"), "unselected option not allergy evidence");
+        detail = page("商品详情", "口味虾", "¥39", "加购");
+        check(detail != null, "dish beginning with option keyword");
+        detail = page("关闭", "原味鸡", "¥15", "加购", "商品评价", "花生过敏用户评论");
+        check(detail != null && !detail.evidence.contains("花生"), "review not ingredient evidence");
+        for (String food : new String[]{"卤肉饭", "脆皮手枪腿", "吮指原味鸡", "奥尔良鸡肉卷", "烤冷面", "油条", "杨枝甘露", "一碗牛肉面"}) {
+            check(page("关闭", food, "¥15", "加购") != null, "expanded food names: " + food);
+        }
+        check(page("香辣鸡腿堡", "¥12", "加购") == null, "plain single list card still rejected");
+        check(page("返回", "香辣鸡腿堡", "¥12", "加购") == null, "back alone is not detail context");
+        check(page("首页", "香辣鸡腿堡", "¥12", "选规格") == null, "list select-spec is not an open spec panel");
+        check(page("关闭", "香辣鸡腿堡", "¥12", "牛肉饭", "¥20", "加购") == null, "multi-item dismissible promotion rejected");
+        check(page("商品详情", "苹果手机 月售100 ￥5999", "立即购买") == null, "metadata cleanup must not turn phone into fruit");
+        check(page("关闭", "牛肉狗粮", "¥20", "加购") == null, "pet food with weaker detail signals rejected");
+        check(page("商品详情", "牛肉饭", "¥20", "加入粉丝群") == null, "generic join text not a purchase action");
+        check(page("选择规格", "香辣鸡腿堡", "口味", "牛肉", "¥5", "选好了").price != 5,
+                "addon price is not meal price");
+        check(FoodDetailDetector.identity("【招牌】香辣鸡腿堡 月售10 ￥12")
+                .equals(FoodDetailDetector.identity("香辣鸡腿堡")), "stable identity across metadata updates");
+        check(page((String) null, "商品详情", "牛肉饭", "￥20", "加购") != null, "null node tolerated");
+
         DetailVisitTracker visits = new DetailVisitTracker();
         check(!visits.observe("A", 1000), "initial detail waits");
         check(!visits.observe("A", 1300), "animation not stable");
