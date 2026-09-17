@@ -27,8 +27,10 @@ public final class MealNutritionAnalyzer {
         List<String> allergyHits = findAllergyHits(evidence, allergy);
         String tasteResult = tasteResult(evidence, taste);
         double budgetLimit = parseBudgetLimit(budget);
-        double comboPrice = recommendedPrice(template, budgetLimit - price);
-        List<String> recommendations = recommendations(template, comboPrice);
+        boolean priceKnown = !Double.isNaN(price) && !Double.isInfinite(price) && price >= 0;
+        double comboPrice = priceKnown ? recommendedPrice(template, budgetLimit - price) : 0;
+        List<String> recommendations = priceKnown ? recommendations(template, comboPrice) : new ArrayList<>();
+        if (!priceKnown) recommendations.add("未识别餐品价格，暂不提供预算搭配");
         return new Result(nutrition, allergyHits, tasteResult, budgetLimit,
                 comboPrice, recommendations, template.label);
     }

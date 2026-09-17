@@ -5,7 +5,6 @@ import android.accessibilityservice.AccessibilityServiceInfo;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
@@ -20,14 +19,13 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import com.nutriflow.app.analysis.DetailVisitTracker;
+import com.nutriflow.app.analysis.DeliveryLaunch;
+import com.nutriflow.app.analysis.FoodDetailDetector;
 import com.nutriflow.app.analysis.MealNutrition;
 import com.nutriflow.app.analysis.MealNutritionAnalyzer;
 
-import java.util.HashSet;
 import java.util.Locale;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Cross-app bridge for the supported delivery apps.
@@ -49,45 +47,34 @@ public class MealAccessibilityService extends AccessibilityService {
             "com.taobao.taobao",
             "com.jingdong.app.mall"
     };
-    private static final String[] DETAIL_SIGNALS = {
-            "加入购物车", "立即购买", "选规格", "商品描述", "套餐详情",
-            "口味", "规格", "配送费", "到手价"
-    };
-    private static final String[] FOOD_SIGNALS = {
-            "饭", "面", "粉", "粥", "肉", "鸡", "鸭", "牛", "羊", "鱼",
-            "虾", "菜", "蛋", "堡", "汉堡", "沙拉", "披萨", "寿司",
-            "烧烤", "烤", "炸", "汤", "米线", "盖饭", "奶茶", "咖啡",
-            "豆浆", "三明治", "套餐", "小吃", "卷", "饺子", "馄饨"
-    };
-    private static final String[] GENERIC_WORDS = {
-            "返回", "首页", "购物车", "搜索", "确认", "取消", "更多", "评论",
-            "收藏", "立即购买", "加入购物车", "优惠券", "店铺", "商品详情",
-            "商品", "详情", "规格", "数量", "配送", "地址", "美团", "饿了么",
-            "淘宝", "京东", "全部", "分类", "推荐", "已售", "月售", "营业中"
-    };
-
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final DetailVisitTracker visits = new DetailVisitTracker();
     private WindowManager windowManager;
     private View overlay;
+    private TextView recognitionToggle;
     private Runnable pendingScan;
-    private long lastShownAt;
-    private long lastInteractionAt;
-    private long lastWindowScheduleAt;
+    private String sessionPackage = "";
+    private String overlayKey = "";
+    private boolean recognitionEnabled;
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-
+        recognitionEnabled = getSharedPreferences("nutriflow", MODE_PRIVATE)
+                .getBoolean("recognition_enabled", false);
         AccessibilityServiceInfo info = getServiceInfo();
         if (info == null) info = new AccessibilityServiceInfo();
         info.eventTypes = AccessibilityEvent.TYPE_VIEW_CLICKED
-                | AccessibilityEvent.TYPE_VIEW_SELECTED
+                | AccessibilityEvent.TYPE_VIEW_SCROLLED
                 | AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                | AccessibilityEvent.TYPE_WINDOWS_CHANGED
                 | AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
-        info.notificationTimeout = 80;
-        info.packageNames = DELIVERY_PACKAGES;
+        info.notificationTimeout = 120;
+        // Observe foreground changes so overlays also disappear on Home/Recents.
+        // Text is read only from the explicitly launched delivery app below.
+        info.packageNames = null;
         info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                 | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
         setServiceInfo(info);
@@ -96,29 +83,17 @@ public class MealAccessibilityService extends AccessibilityService {
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null) return;
-        CharSequence packageName = event.getPackageName();
-        String pkg = packageName == null ? "" : packageName.toString();
-        if (!isDeliveryPackage(pkg)) return;
-
-        int type = event.getEventType();
-        long now = System.currentTimeMillis();
-        if (type == AccessibilityEvent.TYPE_VIEW_CLICKED
-                || type == AccessibilityEvent.TYPE_VIEW_SELECTED) {
-            lastInteractionAt = now;
-            String clicked = readClickedText(event);
-            scheduleClickScan(pkg, clicked);
-            return;
+        String pkg = event.getPackageName() == null ? "" : event.getPackageName().toString();
+        if (isDeliveryPackage(pkg) && DeliveryLaunch.consume(this, pkg)) {
+            hideSessionViews();
+            sessionPackage = pkg;
+            visits.reset();
         }
-
-        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
-                || type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
-            // A few clients do not emit TYPE_VIEW_CLICKED. For those clients,
-            // a detail-page tree change is the reliable fallback.
-            if (now - lastInteractionAt < 900) return;
-            if (now - lastWindowScheduleAt < 900) return;
-            lastWindowScheduleAt = now;
-            scheduleDetailScan(pkg);
-        }
+        if (sessionPackage.isEmpty()) return;
+        // Our own sheet/button updates must never become meal evidence.
+        if (getPackageName().equals(pkg)
+                && event.getEventType() == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) return;
+        scheduleScan(180);
     }
 
     private boolean isDeliveryPackage(String pkg) {
@@ -126,174 +101,187 @@ public class MealAccessibilityService extends AccessibilityService {
         return false;
     }
 
-    private void scheduleClickScan(final String pkg, final String clicked) {
-        cancelPendingScan();
-        pendingScan = new Runnable() {
-            @Override public void run() {
-                if (tryShowAnalysis(pkg, clicked, false)) return;
-                // The detail page may need another frame to finish rendering.
-                pendingScan = new Runnable() {
-                    @Override public void run() { tryShowAnalysis(pkg, clicked, false); }
-                };
-                handler.postDelayed(pendingScan, 480);
-            }
+    private void scheduleScan(long delay) {
+        // Coalesce noisy content updates without indefinitely postponing a scan.
+        if (pendingScan != null) return;
+        pendingScan = () -> {
+            pendingScan = null;
+            inspectForeground();
         };
-        handler.postDelayed(pendingScan, 320);
-    }
-
-    private void scheduleDetailScan(final String pkg) {
-        cancelPendingScan();
-        pendingScan = new Runnable() {
-            @Override public void run() { tryShowAnalysis(pkg, "", true); }
-        };
-        handler.postDelayed(pendingScan, 420);
+        handler.postDelayed(pendingScan, delay);
     }
 
     private void cancelPendingScan() {
-        if (pendingScan != null) {
-            handler.removeCallbacks(pendingScan);
-            pendingScan = null;
-        }
+        if (pendingScan != null) handler.removeCallbacks(pendingScan);
+        pendingScan = null;
     }
 
-    private boolean tryShowAnalysis(String pkg, String clicked, boolean detailOnly) {
-        if (overlay != null) return true;
-        long now = System.currentTimeMillis();
-        if (now - lastShownAt < 950) return true;
-
-        String pageText = readActiveWindowText();
-        boolean detail = isLikelyDetailPage(pageText);
-        String foodName = pickFoodName(clicked, pageText);
-        if (!looksLikeFood(foodName)) {
-            if (!detail) return false;
-            foodName = "当前餐品";
-        }
-        // A content-change fallback must prove that the visible page is a
-        // detail page. A direct click can use the clicked food title itself.
-        if (detailOnly && !detail) return false;
-
-        lastShownAt = now;
-        showOverlay(foodName, pageText, parsePrice(clicked, pageText), pkg);
-        return true;
-    }
-
-    private String readClickedText(AccessibilityEvent event) {
-        StringBuilder out = new StringBuilder();
-        Set<String> seen = new HashSet<>();
-        for (CharSequence item : event.getText()) appendUnique(out, seen, item);
-        appendUnique(out, seen, event.getContentDescription());
-
-        AccessibilityNodeInfo source = event.getSource();
-        if (source != null) {
-            appendNodeText(source, out, seen, 0);
-            AccessibilityNodeInfo parent = source.getParent();
-            if (parent != null) {
-                appendNodeText(parent, out, seen, 0);
-                parent.recycle();
-            }
-            source.recycle();
-        }
-        return out.toString().trim();
-    }
-
-    private String readActiveWindowText() {
+    private void inspectForeground() {
         AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return "";
-        StringBuilder out = new StringBuilder();
-        appendNodeText(root, out, new HashSet<String>(), 0);
-        root.recycle();
-        return out.toString().trim();
+        if (root == null) {
+            hideSessionViews();
+            return;
+        }
+        try {
+            String pkg = root.getPackageName() == null ? "" : root.getPackageName().toString();
+            android.app.KeyguardManager lock = (android.app.KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+            android.os.PowerManager power = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (!sessionPackage.equals(pkg) || !isDeliveryWindowFocused()
+                    || (lock != null && lock.isKeyguardLocked())
+                    || (power != null && !power.isInteractive())) {
+                hideSessionViews();
+                return;
+            }
+            showRecognitionToggle();
+            if (!recognitionEnabled) return;
+            android.graphics.Rect bounds = new android.graphics.Rect();
+            root.getBoundsInScreen(bounds);
+            ScanBudget budget = new ScanBudget();
+            Scope scope = readScope(root, bounds, budget, 0);
+            FoodDetailDetector.Result detail = budget.nodes > 600 || budget.characters > 18000
+                    ? null : scope.detail;
+            String key = detail == null ? "" : pkg + ":" + root.getWindowId() + ":" + detail.foodName;
+            boolean ready = visits.observe(key, android.os.SystemClock.uptimeMillis());
+            if (detail == null || (!overlayKey.isEmpty() && !overlayKey.equals(key))) removeOverlay();
+            if (detail != null && ready && overlay == null) {
+                showOverlay(detail.foodName, detail.evidence, detail.price, pkg);
+                if (overlay != null) {
+                    overlayKey = key;
+                    visits.markShown(key);
+                }
+            }
+        } finally {
+            root.recycle();
+            // Also detects leaving a detail/app when the client emits no useful event.
+            // When disabled, this poll checks only the foreground package, never page text.
+            if (recognitionToggle != null) scheduleScan(750);
+        }
     }
 
-    private void appendNodeText(AccessibilityNodeInfo node, StringBuilder out,
-                                Set<String> seen, int depth) {
-        if (node == null || depth > 24 || out.length() > 12000) return;
-        appendUnique(out, seen, node.getText());
-        appendUnique(out, seen, node.getContentDescription());
+    private boolean isDeliveryWindowFocused() {
+        java.util.List<android.view.accessibility.AccessibilityWindowInfo> windows = getWindows();
+        boolean matches = true;
+        for (android.view.accessibility.AccessibilityWindowInfo window : windows) {
+            try {
+                if (!window.isFocused() || window.getType()
+                        == android.view.accessibility.AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) continue;
+                AccessibilityNodeInfo focused = window.getRoot();
+                if (focused != null) {
+                    try {
+                        if (!sessionPackage.contentEquals(focused.getPackageName() == null
+                                ? "" : focused.getPackageName())) matches = false;
+                    } finally { focused.recycle(); }
+                }
+            } finally { window.recycle(); }
+        }
+        return matches;
+    }
 
+    private static final class ScanBudget { int nodes; int characters; }
+    private static final class Scope {
+        final java.util.List<String> lines = new java.util.ArrayList<>();
+        FoodDetailDetector.Result detail;
+        boolean ambiguous;
+    }
+
+    private Scope readScope(AccessibilityNodeInfo node, android.graphics.Rect screen,
+                            ScanBudget budget, int depth) {
+        Scope result = new Scope();
+        if (depth > 24 || budget.nodes++ > 600 || budget.characters > 18000
+                || !node.isVisibleToUser()) return result;
+        android.graphics.Rect rect = new android.graphics.Rect();
+        node.getBoundsInScreen(rect);
+        if (!android.graphics.Rect.intersects(screen, rect)) return result;
+        addText(result.lines, node.getText(), budget);
+        if (node.getContentDescription() != null
+                && !node.getContentDescription().toString().contentEquals(
+                        node.getText() == null ? "" : node.getText())) {
+            addText(result.lines, node.getContentDescription(), budget);
+        }
         int count = Math.min(node.getChildCount(), 80);
         for (int i = 0; i < count; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                appendNodeText(child, out, seen, depth + 1);
-                child.recycle();
-            }
+            if (child == null) continue;
+            try {
+                Scope sub = readScope(child, screen, budget, depth + 1);
+                result.lines.addAll(sub.lines);
+                // A foreground detail sheet may have a still-visible menu behind it.
+                // Use a complete detail container instead of mixing its background text.
+                if (sub.ambiguous) result.ambiguous = true;
+                if (sub.detail != null) {
+                    if (result.detail != null && !result.detail.foodName.equals(sub.detail.foodName)) {
+                        result.ambiguous = true;
+                    }
+                    result.detail = sub.detail;
+                }
+            } finally { child.recycle(); }
+        }
+        if (result.ambiguous) { result.detail = null; return result; }
+        if (result.detail == null && rect.width() >= screen.width() * 0.65f
+                && rect.height() >= screen.height() * 0.35f) {
+            result.detail = FoodDetailDetector.detect(result.lines);
+        }
+        return result;
+    }
+
+    private void addText(java.util.List<String> lines, CharSequence raw, ScanBudget budget) {
+        if (raw == null || raw.length() > 1200) return;
+        for (String part : raw.toString().split("[\\n\\r|•]+")) {
+            String text = part.trim();
+            if (text.isEmpty() || text.length() > 180) continue;
+            budget.characters += text.length();
+            lines.add(text);
         }
     }
 
-    private void appendUnique(StringBuilder out, Set<String> seen, CharSequence value) {
-        if (value == null) return;
-        String text = value.toString().replace('\n', ' ').replace('\r', ' ').trim();
-        if (text.length() == 0 || text.length() > 180 || seen.contains(text)) return;
-        seen.add(text);
-        if (out.length() > 0) out.append(" · ");
-        out.append(text);
+    private void showRecognitionToggle() {
+        if (recognitionToggle != null || windowManager == null) return;
+        // Accessibility overlays are available from API 22; do not use TYPE_PHONE
+        // (which would silently require an unrelated overlay permission on API 21).
+        if (Build.VERSION.SDK_INT < 22) return;
+        recognitionToggle = txt("", 12, Color.WHITE);
+        recognitionToggle.setGravity(Gravity.CENTER);
+        recognitionToggle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        recognitionToggle.setElevation(dp(6));
+        recognitionToggle.setOnClickListener(v -> {
+            recognitionEnabled = !recognitionEnabled;
+            getSharedPreferences("nutriflow", MODE_PRIVATE).edit()
+                    .putBoolean("recognition_enabled", recognitionEnabled).apply();
+            cancelPendingScan();
+            removeOverlay();
+            visits.reset();
+            updateToggle();
+            scheduleScan(180);
+        });
+        updateToggle();
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(dp(112), dp(48),
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT);
+        params.gravity = Gravity.TOP | Gravity.START;
+        params.x = dp(10);
+        params.y = dp(56);
+        try { windowManager.addView(recognitionToggle, params); }
+        catch (RuntimeException ignored) { recognitionToggle = null; }
     }
 
-    private boolean isLikelyDetailPage(String text) {
-        if (text == null || text.length() == 0) return false;
-        int hits = 0;
-        for (String signal : DETAIL_SIGNALS) if (text.contains(signal)) hits++;
-        boolean hasPrice = Pattern.compile("(?:¥|￥)\\s*\\d").matcher(text).find();
-        return hits >= 1 && hasPrice;
+    private void updateToggle() {
+        if (recognitionToggle == null) return;
+        recognitionToggle.setText("◉ 营养流\n" + (recognitionEnabled ? "识别已开" : "识别已关"));
+        recognitionToggle.setBackground(rounded(recognitionEnabled ? GREEN : MUTED, 16));
+        recognitionToggle.setContentDescription(recognitionEnabled
+                ? "营养流识别已开启，点击关闭" : "营养流识别已关闭，点击开启");
     }
 
-    private String pickFoodName(String clicked, String pageText) {
-        String best = "";
-        int bestScore = -1000;
-        String[] clickedParts = splitCandidates(clicked);
-        for (String part : clickedParts) {
-            int score = foodScore(part);
-            if (score > bestScore) { bestScore = score; best = part; }
+    private void hideSessionViews() {
+        cancelPendingScan();
+        removeOverlay();
+        visits.reset();
+        if (recognitionToggle != null && windowManager != null) {
+            try { windowManager.removeView(recognitionToggle); } catch (RuntimeException ignored) { }
+            recognitionToggle = null;
         }
-        String[] pageParts = splitCandidates(pageText);
-        for (String part : pageParts) {
-            int score = foodScore(part);
-            if (score > bestScore) { bestScore = score; best = part; }
-        }
-        return bestScore >= 1 ? best : "";
-    }
-
-    private String[] splitCandidates(String value) {
-        if (value == null) return new String[0];
-        return value.split("[\\n\\r·|•]+");
-    }
-
-    private int foodScore(String value) {
-        if (!looksLikeFood(value)) return -1000;
-        String text = value.trim();
-        int score = 1;
-        for (String signal : FOOD_SIGNALS) if (text.contains(signal)) score += 4;
-        for (String generic : GENERIC_WORDS) if (text.equals(generic)) score -= 10;
-        if (text.length() >= 3 && text.length() <= 22) score += 2;
-        if (text.length() > 38) score -= 5;
-        if (text.matches(".*\\d{2}:\\d{2}.*")) score -= 8;
-        if (text.matches(".*\\d{4,}.*")) score -= 5;
-        if (text.contains("营养流") || text.contains("分析")) score -= 12;
-        return score;
-    }
-
-    private boolean looksLikeFood(String text) {
-        if (text == null) return false;
-        String value = text.replace(" ", "").trim();
-        if (value.length() < 2 || value.length() > 60) return false;
-        if (!value.matches(".*[\\u4e00-\\u9fffA-Za-z].*")) return false;
-        if (value.matches("^[0-9.¥￥元元起+\\-]+$")) return false;
-        for (String generic : GENERIC_WORDS) if (value.equals(generic)) return false;
-        return true;
-    }
-
-    private double parsePrice(String clicked, String pageText) {
-        String all = (clicked == null ? "" : clicked) + " · " + (pageText == null ? "" : pageText);
-        Matcher symbol = Pattern.compile("(?:¥|￥)\\s*(\\d{1,4}(?:\\.\\d{1,2})?)").matcher(all);
-        if (symbol.find()) {
-            try { return Double.parseDouble(symbol.group(1)); } catch (NumberFormatException ignored) { }
-        }
-        Matcher context = Pattern.compile("(?:到手价|预计价|售价|价格)[^0-9]{0,10}(\\d{1,4}(?:\\.\\d{1,2})?)").matcher(all);
-        if (context.find()) {
-            try { return Double.parseDouble(context.group(1)); } catch (NumberFormatException ignored) { }
-        }
-        return 25.0;
     }
 
     private int dp(float value) {
@@ -361,7 +349,7 @@ public class MealAccessibilityService extends AccessibilityService {
         header.addView(close, new LinearLayout.LayoutParams(dp(38), dp(38)));
         sheet.addView(header);
 
-        TextView item = txt("已捕获餐品点击：" + shorten(rawText)
+        TextView item = txt("当前菜品：" + shorten(rawText)
                 + "\n来源：" + packageLabel(packageName)
                 + " · " + nutrition.servingSummary(), 13, MUTED);
         item.setLineSpacing(0, 1.2f);
@@ -396,14 +384,15 @@ public class MealAccessibilityService extends AccessibilityService {
         metric(body, "忌口", allergyValue,
                 analysis.hasAllergyConflict() ? "页面文字命中设置中的配料，请谨慎购买" : "未命中设置中的配料关键词",
                 analysis.hasAllergyConflict());
-        metric(body, "预算", String.format(Locale.CHINA, "¥%.2f", price),
-                price > budget
+        boolean priceKnown = !Double.isNaN(price);
+        metric(body, "预算", priceKnown ? String.format(Locale.CHINA, "¥%.2f", price) : "未识别价格",
+                !priceKnown ? "请以商品页面价格为准，暂不判断预算" : price > budget
                         ? String.format(Locale.CHINA, "超预算 ¥%.2f", price - budget)
                         : String.format(Locale.CHINA, "低于预算 ¥%.2f", budget - price),
                 price > budget);
         metric(body, "口味", analysis.getTasteResult(), "根据餐品名称和页面标签推断", false);
         String recommendations = join(analysis.getRecommendations(), "\n");
-        body.addView(txt("推荐搭配（剩余预算内）\n" + recommendations
+        body.addView(txt(!priceKnown ? "未识别到餐品价格，暂不提供预算搭配。" : "推荐搭配（剩余预算内）\n" + recommendations
                 + String.format(Locale.CHINA, "\n搭配预算约 ¥%.2f · 餐品和搭配合计 ¥%.2f",
                 analysis.getRecommendationPrice(), price + analysis.getRecommendationPrice()), 12, MUTED));
 
@@ -418,27 +407,30 @@ public class MealAccessibilityService extends AccessibilityService {
             String meal = NutritionLogStore.mealName(NutritionLogStore.mealForHour(
                     java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)));
             NutritionLogStore.append(this, NutritionLogStore.todayKey(), meal,
-                    shorten(rawText), (int) nutrition.getPortionGrams(), price, "跨应用点击");
+                    shorten(rawText), (int) nutrition.getPortionGrams(), price, "跨应用详情");
             record.setText("已记录 ✓");
             record.setEnabled(false);
         });
+        if (!priceKnown) {
+            record.setEnabled(false);
+            record.setText("未识别价格，请返回营养流手动记录");
+        }
         sheet.addView(record, new LinearLayout.LayoutParams(-1, dp(48)));
 
         TextView note = txt("点击右上角 × 可退出分析并继续浏览外卖页面。营养数据为估算，不是平台营养标签或医学诊断。", 10, MUTED);
         note.setGravity(Gravity.CENTER);
         sheet.addView(note, new LinearLayout.LayoutParams(-1, dp(40)));
 
+        if (Build.VERSION.SDK_INT < 22) return;
         overlay = sheet;
         if (windowManager == null) windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-        int type = Build.VERSION.SDK_INT >= 22
-                ? WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
-                : WindowManager.LayoutParams.TYPE_PHONE;
+        int type = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY;
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 -1,
                 (int) (getResources().getDisplayMetrics().heightPixels * 0.75f),
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.BOTTOM;
         try {
@@ -500,6 +492,7 @@ public class MealAccessibilityService extends AccessibilityService {
     }
 
     private void removeOverlay() {
+        overlayKey = "";
         if (overlay != null && windowManager != null) {
             try { windowManager.removeView(overlay); } catch (Exception ignored) { }
             overlay = null;
@@ -507,13 +500,14 @@ public class MealAccessibilityService extends AccessibilityService {
     }
 
     @Override
-    public void onInterrupt() { }
+    public void onInterrupt() { hideSessionViews(); }
 
     @Override
     public void onDestroy() {
         cancelPendingScan();
         handler.removeCallbacksAndMessages(null);
-        removeOverlay();
+        hideSessionViews();
+        sessionPackage = "";
         super.onDestroy();
     }
 }

@@ -777,7 +777,7 @@ public class MainActivity extends Activity {
         page.addView(intro);
         LinearLayout access = card();
         access.addView(title("跨应用餐品分析", 15));
-        TextView accessText = text(isAccessibilityEnabled() ? "已开启：在美团、饿了么、淘宝闪购或京东外卖中点击餐品，会弹出营养分析并可记录到对应餐次。" : "尚未开启。Android 需要你在系统设置中主动授权，营养流才可以在外卖 App 的餐品页面显示分析。", 12, MUTED);
+        TextView accessText = text(isAccessibilityEnabled() ? "权限已开启：从营养流打开外卖 App，点击左上角“营养流”开关开启识别，再进入食品详情查看营养估算。首次默认关闭。" : "尚未开启。Android 需要你在系统设置中主动授权，营养流才可以在外卖 App 的餐品页面显示分析。", 12, MUTED);
         accessText.setLineSpacing(0, 1.25f);
         margin(accessText, 0, 4, 0, 8);
         access.addView(accessText);
@@ -805,7 +805,12 @@ public class MainActivity extends Activity {
     private void openDeliveryApp(DeliveryApp app) {
         Intent launch = getPackageManager().getLaunchIntentForPackage(app.packageName);
         if (launch == null) { Toast.makeText(this, app.label + "未安装或没有可打开的页面", Toast.LENGTH_SHORT).show(); return; }
-        try { startActivity(launch); } catch (Exception e) { Toast.makeText(this, "暂时无法打开 " + app.label, Toast.LENGTH_SHORT).show(); }
+        com.nutriflow.app.analysis.DeliveryLaunch.prepare(this, app.packageName);
+        try { startActivity(launch); }
+        catch (Exception e) {
+            com.nutriflow.app.analysis.DeliveryLaunch.cancel(this);
+            Toast.makeText(this, "暂时无法打开 " + app.label, Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void refreshInstalledApps() {
