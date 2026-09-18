@@ -86,6 +86,9 @@ public class MainActivity extends Activity {
     private Button verificationSubmit;
     private boolean authPage = false;
     private boolean professionalHome = false;
+    private TextView crossAppStatusText;
+    private Button crossAppSettingsButton;
+    private Button crossAppPauseButton;
 
     @Override public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -95,6 +98,11 @@ public class MainActivity extends Activity {
         selectedLogDate = NutritionLogStore.todayKey();
         refreshInstalledApps();
         if (prefs.getBoolean("auth_logged_in", false)) routeAfterLogin(); else showRoleChooser();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        updateCrossAppStatus();
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
@@ -138,6 +146,9 @@ public class MainActivity extends Activity {
     private LinearLayout row() { LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.HORIZONTAL); l.setGravity(Gravity.CENTER_VERTICAL); return l; }
 
     private void base() {
+        crossAppStatusText = null;
+        crossAppSettingsButton = null;
+        crossAppPauseButton = null;
         root = column(); root.setBackgroundColor(BG); setContentView(root);
     }
 
@@ -795,6 +806,19 @@ public class MainActivity extends Activity {
             catch (Exception e) { Toast.makeText(this, "无法打开系统无障碍设置，请在手机设置中搜索“无障碍”", Toast.LENGTH_LONG).show(); }
         });
         access.addView(accessButton);
+        boolean analysisEnabled = prefs.getBoolean(MealAccessibilityService.PREF_ANALYSIS_ENABLED, true);
+        Button pauseButton = outline(analysisEnabled ? "暂停餐品分析" : "恢复餐品分析");
+        margin(pauseButton, 0, 8, 0, 0);
+        pauseButton.setOnClickListener(v -> {
+            boolean currentlyEnabled = prefs.getBoolean(MealAccessibilityService.PREF_ANALYSIS_ENABLED, true);
+            prefs.edit().putBoolean(MealAccessibilityService.PREF_ANALYSIS_ENABLED, !currentlyEnabled).apply();
+            showAppsPage();
+        });
+        access.addView(pauseButton);
+        crossAppStatusText = accessText;
+        crossAppSettingsButton = accessButton;
+        crossAppPauseButton = pauseButton;
+        updateCrossAppStatus();
         margin(access, 0, 0, 0, 12);
         page.addView(access);
         for (final DeliveryApp app : deliveryApps) {
@@ -809,6 +833,18 @@ public class MainActivity extends Activity {
     private boolean isAccessibilityEnabled() {
         String enabled = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
         return enabled != null && enabled.toLowerCase(Locale.CHINA).contains(getPackageName().toLowerCase(Locale.CHINA));
+    }
+    private void updateCrossAppStatus() {
+        if (crossAppStatusText == null || prefs == null) return;
+        boolean granted = isAccessibilityEnabled();
+        crossAppStatusText.setText(granted
+                ? "已开启：在美团、饿了么、淘宝闪购或京东外卖中点击餐品，会弹出营养分析并可记录到对应餐次。"
+                : "尚未开启。Android 需要你在系统设置中主动授权，营养流才可以在外卖 App 的餐品页面显示分析。");
+        if (crossAppSettingsButton != null) crossAppSettingsButton.setText(
+                granted ? "打开系统设置查看权限" : "开启跨应用分析权限");
+        if (crossAppPauseButton != null) crossAppPauseButton.setText(
+                prefs.getBoolean(MealAccessibilityService.PREF_ANALYSIS_ENABLED, true)
+                        ? "暂停餐品分析" : "恢复餐品分析");
     }
     private void openDeliveryApp(DeliveryApp app) {
         Intent launch = getPackageManager().getLaunchIntentForPackage(app.packageName);

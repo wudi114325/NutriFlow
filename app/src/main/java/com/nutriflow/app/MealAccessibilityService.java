@@ -2,19 +2,24 @@ package com.nutriflow.app;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.hardware.HardwareBuffer;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -22,11 +27,15 @@ import android.widget.TextView;
 
 import com.nutriflow.app.analysis.MealNutrition;
 import com.nutriflow.app.analysis.MealNutritionAnalyzer;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
 
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.List;
 import java.util.Set;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -38,6 +47,8 @@ import java.util.regex.Pattern;
  * analysis sheet.
  */
 public class MealAccessibilityService extends AccessibilityService {
+    private static final String LOG_TAG = "NutriFlowAccess";
+    static final String PREF_ANALYSIS_ENABLED = "cross_app_analysis_enabled";
     private static final int GREEN = Color.rgb(13, 135, 95);
     private static final int DARK = Color.rgb(23, 51, 43);
     private static final int MUTED = Color.rgb(102, 124, 115);
@@ -69,14 +80,36 @@ public class MealAccessibilityService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WindowManager windowManager;
     private View overlay;
+    private TextView floatingSwitch;
     private Runnable pendingScan;
+    private String currentDeliveryPackage = "";
+    private String dismissedFoodKey = "";
+    private boolean screenshotRecognitionRunning;
+    private long lastScreenshotRecognitionAt;
+    private boolean serviceDestroyed;
     private long lastShownAt;
     private long lastInteractionAt;
     private long lastWindowScheduleAt;
+    private final Runnable floatingSwitchMonitor = new Runnable() {
+        @Override public void run() {
+            if (floatingSwitch == null || serviceDestroyed) return;
+            String foreground = foregroundPackage();
+            if (!isDeliveryPackage(foreground)) {
+                currentDeliveryPackage = "";
+                cancelPendingScan();
+                removeOverlay();
+                removeFloatingSwitch();
+                return;
+            }
+            currentDeliveryPackage = foreground;
+            handler.postDelayed(this, 1200);
+        }
+    };
 
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+        serviceDestroyed = false;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
         AccessibilityServiceInfo info = getServiceInfo();
@@ -87,10 +120,20 @@ public class MealAccessibilityService extends AccessibilityService {
                 | AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
         info.notificationTimeout = 80;
+        // Listen only to supported delivery apps. A lightweight foreground
+        // check removes our switch when the user leaves one of them.
         info.packageNames = DELIVERY_PACKAGES;
         info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                 | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
         setServiceInfo(info);
+        Log.d(LOG_TAG, "Service connected with delivery-package window events");
+        handler.postDelayed(() -> {
+            String activePackage = foregroundPackage();
+            if (!isDeliveryPackage(activePackage)) return;
+            currentDeliveryPackage = activePackage;
+            showFloatingSwitch();
+            if (isAnalysisEnabled()) tryShowAnalysis(activePackage, "", true);
+        }, 700);
     }
 
     @Override
@@ -98,10 +141,29 @@ public class MealAccessibilityService extends AccessibilityService {
         if (event == null) return;
         CharSequence packageName = event.getPackageName();
         String pkg = packageName == null ? "" : packageName.toString();
-        if (!isDeliveryPackage(pkg)) return;
 
         int type = event.getEventType();
         long now = System.currentTimeMillis();
+        if ("com.taobao.taobao".equals(pkg)
+                && type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            Log.d(LOG_TAG, "Taobao window event received");
+        }
+        if (!isDeliveryPackage(pkg)) {
+            if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                String foreground = foregroundPackage();
+                if (!isDeliveryPackage(foreground)) {
+                    currentDeliveryPackage = "";
+                    cancelPendingScan();
+                    removeFloatingSwitch();
+                    removeOverlay();
+                }
+            }
+            return;
+        }
+
+        currentDeliveryPackage = pkg;
+        showFloatingSwitch();
+        if (!isAnalysisEnabled()) return;
         if (type == AccessibilityEvent.TYPE_VIEW_CLICKED
                 || type == AccessibilityEvent.TYPE_VIEW_SELECTED) {
             lastInteractionAt = now;
@@ -157,6 +219,7 @@ public class MealAccessibilityService extends AccessibilityService {
     }
 
     private boolean tryShowAnalysis(String pkg, String clicked, boolean detailOnly) {
+        if (!isAnalysisEnabled() || !pkg.equals(currentDeliveryPackage)) return false;
         if (overlay != null) return true;
         long now = System.currentTimeMillis();
         if (now - lastShownAt < 950) return true;
@@ -164,6 +227,11 @@ public class MealAccessibilityService extends AccessibilityService {
         String pageText = readActiveWindowText();
         boolean detail = isLikelyDetailPage(pageText);
         String foodName = pickFoodName(clicked, pageText);
+        if ("com.taobao.taobao".equals(pkg) && !detail) {
+            recognizeTaobaoScreenshot(pkg, clicked);
+            return false;
+        }
+        if (!detail && clicked.length() == 0) dismissedFoodKey = "";
         if (!looksLikeFood(foodName)) {
             if (!detail) return false;
             foodName = "当前餐品";
@@ -171,10 +239,179 @@ public class MealAccessibilityService extends AccessibilityService {
         // A content-change fallback must prove that the visible page is a
         // detail page. A direct click can use the clicked food title itself.
         if (detailOnly && !detail) return false;
+        if ((pkg + "|" + foodName).equals(dismissedFoodKey)) return false;
 
         lastShownAt = now;
         showOverlay(foodName, pageText, parsePrice(clicked, pageText), pkg);
         return true;
+    }
+
+    private void recognizeTaobaoScreenshot(final String pkg, final String clicked) {
+        if (Build.VERSION.SDK_INT < 30 || screenshotRecognitionRunning
+                || !isAnalysisEnabled() || !pkg.equals(currentDeliveryPackage)) return;
+        long now = System.currentTimeMillis();
+        if (now - lastScreenshotRecognitionAt < 2500) return;
+        lastScreenshotRecognitionAt = now;
+        screenshotRecognitionRunning = true;
+        Log.d(LOG_TAG, "Taobao screenshot recognition requested");
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
+                @Override public void onSuccess(ScreenshotResult screenshot) {
+                    Log.d(LOG_TAG, "Taobao screenshot received");
+                    Bitmap image = null;
+                    HardwareBuffer buffer = screenshot.getHardwareBuffer();
+                    try {
+                        Bitmap hardware = Bitmap.wrapHardwareBuffer(buffer, screenshot.getColorSpace());
+                        if (hardware != null) {
+                            image = hardware.copy(Bitmap.Config.ARGB_8888, false);
+                            hardware.recycle();
+                        }
+                    } catch (Exception ignored) { }
+                    finally { buffer.close(); }
+                    if (image == null) {
+                        screenshotRecognitionRunning = false;
+                        return;
+                    }
+                    final Bitmap bitmap = image;
+                    final TextRecognizer recognizer = TextRecognition.getClient(
+                            new ChineseTextRecognizerOptions.Builder().build());
+                    try {
+                        recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                                .addOnSuccessListener(result -> {
+                                    String foreground = foregroundPackage();
+                                    Log.d(LOG_TAG, "Taobao OCR gate foreground=" + foreground
+                                            + " current=" + currentDeliveryPackage
+                                            + " enabled=" + isAnalysisEnabled()
+                                            + " overlay=" + (overlay != null));
+                                    if (serviceDestroyed || !isAnalysisEnabled()
+                                            || !pkg.equals(foreground)
+                                            || overlay != null || result == null) return;
+                                    String text = result.getText();
+                                    boolean detailPage = isLikelyDetailPage(text);
+                                    Log.d(LOG_TAG, "Taobao OCR chars=" + text.length()
+                                            + " detail=" + detailPage);
+                                    if (!detailPage) {
+                                        dismissedFoodKey = "";
+                                        return;
+                                    }
+                                    String titleArea = text;
+                                    int descriptionAt = text.indexOf("商品描述");
+                                    int recommendationsAt = text.indexOf("搭配推荐");
+                                    int end = descriptionAt >= 0 ? descriptionAt : text.length();
+                                    if (recommendationsAt >= 0) end = Math.min(end, recommendationsAt);
+                                    if (end > 0) titleArea = text.substring(0, end);
+                                    String foodName = pickFoodName(clicked, titleArea);
+                                    Log.d(LOG_TAG, "Taobao food candidate valid="
+                                            + looksLikeFood(foodName) + " length=" + foodName.length());
+                                    if (!looksLikeFood(foodName)
+                                            || (pkg + "|" + foodName).equals(dismissedFoodKey)) return;
+                                    lastShownAt = System.currentTimeMillis();
+                                    showOverlay(foodName, text, parsePrice(clicked, text), pkg);
+                                })
+                                .addOnCompleteListener(task -> {
+                                    bitmap.recycle();
+                                    recognizer.close();
+                                    screenshotRecognitionRunning = false;
+                                });
+                    } catch (Exception ignored) {
+                        bitmap.recycle();
+                        recognizer.close();
+                        screenshotRecognitionRunning = false;
+                    }
+                }
+
+                @Override public void onFailure(int errorCode) {
+                    Log.d(LOG_TAG, "Taobao screenshot error=" + errorCode);
+                    screenshotRecognitionRunning = false;
+                }
+            });
+        } catch (Exception error) {
+            Log.d(LOG_TAG, "Taobao screenshot request failed", error);
+            screenshotRecognitionRunning = false;
+        }
+    }
+
+    private boolean isAnalysisEnabled() {
+        return getSharedPreferences("nutriflow", MODE_PRIVATE)
+                .getBoolean(PREF_ANALYSIS_ENABLED, true);
+    }
+
+    private void setAnalysisEnabled(boolean enabled) {
+        getSharedPreferences("nutriflow", MODE_PRIVATE).edit()
+                .putBoolean(PREF_ANALYSIS_ENABLED, enabled).apply();
+        cancelPendingScan();
+        if (!enabled) removeOverlay();
+        else {
+            dismissedFoodKey = "";
+            lastShownAt = 0;
+            lastScreenshotRecognitionAt = 0;
+            handler.postDelayed(() -> {
+                String activePackage = foregroundPackage();
+                if (!isAnalysisEnabled() || !isDeliveryPackage(activePackage)) return;
+                currentDeliveryPackage = activePackage;
+                tryShowAnalysis(activePackage, "", true);
+            }, 350);
+        }
+        updateFloatingSwitch();
+    }
+
+    private String foregroundPackage() {
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows != null) {
+            for (AccessibilityWindowInfo window : windows) {
+                if (window.getType() != AccessibilityWindowInfo.TYPE_APPLICATION) continue;
+                AccessibilityNodeInfo appRoot = window.getRoot();
+                if (appRoot == null) continue;
+                CharSequence appName = appRoot.getPackageName();
+                String appPackage = appName == null ? "" : appName.toString();
+                appRoot.recycle();
+                if (appPackage.length() > 0) return appPackage;
+            }
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return "";
+        CharSequence name = root.getPackageName();
+        String result = name == null ? "" : name.toString();
+        root.recycle();
+        return result;
+    }
+
+    private void showFloatingSwitch() {
+        if (floatingSwitch != null || Build.VERSION.SDK_INT < 22) return;
+        TextView control = txt("", 12, Color.WHITE);
+        control.setGravity(Gravity.CENTER);
+        control.setPadding(dp(5), 0, dp(5), 0);
+        control.setOnClickListener(v -> setAnalysisEnabled(!isAnalysisEnabled()));
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                dp(76), dp(44), WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                PixelFormat.TRANSLUCENT);
+        params.gravity = Gravity.START | Gravity.TOP;
+        params.y = dp(98);
+        try {
+            windowManager.addView(control, params);
+            floatingSwitch = control;
+            updateFloatingSwitch();
+            handler.removeCallbacks(floatingSwitchMonitor);
+            handler.postDelayed(floatingSwitchMonitor, 1200);
+        } catch (Exception error) { Log.d(LOG_TAG, "Floating switch unavailable", error); }
+    }
+
+    private void updateFloatingSwitch() {
+        if (floatingSwitch == null) return;
+        boolean enabled = isAnalysisEnabled();
+        floatingSwitch.setText(enabled ? "分析 开" : "分析 关");
+        floatingSwitch.setContentDescription(enabled
+                ? "营养流分析已开启，点击暂停" : "营养流分析已暂停，点击恢复");
+        floatingSwitch.setBackground(rounded(enabled ? GREEN : MUTED, 14));
+    }
+
+    private void removeFloatingSwitch() {
+        handler.removeCallbacks(floatingSwitchMonitor);
+        if (floatingSwitch == null || windowManager == null) return;
+        try { windowManager.removeView(floatingSwitch); } catch (Exception ignored) { }
+        floatingSwitch = null;
     }
 
     private String readClickedText(AccessibilityEvent event) {
@@ -284,16 +521,7 @@ public class MealAccessibilityService extends AccessibilityService {
     }
 
     private double parsePrice(String clicked, String pageText) {
-        String all = (clicked == null ? "" : clicked) + " · " + (pageText == null ? "" : pageText);
-        Matcher symbol = Pattern.compile("(?:¥|￥)\\s*(\\d{1,4}(?:\\.\\d{1,2})?)").matcher(all);
-        if (symbol.find()) {
-            try { return Double.parseDouble(symbol.group(1)); } catch (NumberFormatException ignored) { }
-        }
-        Matcher context = Pattern.compile("(?:到手价|预计价|售价|价格)[^0-9]{0,10}(\\d{1,4}(?:\\.\\d{1,2})?)").matcher(all);
-        if (context.find()) {
-            try { return Double.parseDouble(context.group(1)); } catch (NumberFormatException ignored) { }
-        }
-        return 25.0;
+        return DisplayedPriceParser.parse(clicked, pageText);
     }
 
     private int dp(float value) {
@@ -357,7 +585,10 @@ public class MealAccessibilityService extends AccessibilityService {
         TextView close = txt("×", 28, MUTED);
         close.setGravity(Gravity.CENTER);
         close.setContentDescription("关闭营养分析");
-        close.setOnClickListener(v -> removeOverlay());
+        close.setOnClickListener(v -> {
+            dismissedFoodKey = packageName + "|" + rawText;
+            removeOverlay();
+        });
         header.addView(close, new LinearLayout.LayoutParams(dp(38), dp(38)));
         sheet.addView(header);
 
@@ -597,9 +828,11 @@ public class MealAccessibilityService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+        serviceDestroyed = true;
         cancelPendingScan();
         handler.removeCallbacksAndMessages(null);
         removeOverlay();
+        removeFloatingSwitch();
         super.onDestroy();
     }
 }

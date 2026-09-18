@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">营养流 NutriFlow</string>
-    <string name="accessibility_service_description">营养流仅在用户主动开启后，监听美团、饿了么、淘宝闪购和京东外卖中的点击餐品，并显示营养分析。不会读取其他应用。</string>
+    <string name="accessibility_service_description">营养流在用户授权后仅接收支持的外卖应用事件，并可通过浮动开关暂停或恢复餐品分析。淘宝页面文字不可读取时，会在本机临时识别屏幕文字，不保存截图。离开外卖应用时仅检查当前应用名称，以便隐藏浮动开关。</string>
 </resources>
